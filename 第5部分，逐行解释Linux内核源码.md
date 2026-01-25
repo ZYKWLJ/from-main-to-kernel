@@ -385,6 +385,7 @@ boot_flag:
 其实，这就是紧接着下面的指令罢了：
 全视图：![bootsect.s-2](img/bootsect/bootsect-2.png)
 
+这里有_start标签，一个标签可以理解为一个内存地址的别称！
 ```s
 _start:
 	mov	$BOOTSEG, %ax	#将ds段寄存器设置为0x7C00，即引导区所在的段地址
@@ -400,11 +401,372 @@ _start:
 显然，我们可以看到，这里是将引导区复制到0x9000段地址处，防止被后续要加载的内容覆盖。
 所以，这里完成了bootsect的第一个功能：**将自身bootsect复制到0x9000段地址处。**
 
+##### 1.2.5.3 设置段寄存器大小，完成内存初始规划：
+```s
+	ljmp	$INITSEG, $go 	
+    # 段间跳转，这里INITSEG指出跳转到的段地址，即将cs的值设置为0x9000
+go:	mov	%cs, %ax		
+    # 将ds，es，ss都设置成移动后代码所在的段处(0x9000)
+	mov	%ax, %ds
+	mov	%ax, %es
+    # put stack at 0x9ff00.
+	mov	%ax, %ss
+	mov	$0xFF00, %sp		
+    # arbitrary value >>512
+```
+执行完自身复制之后，又开始完成bootsect的第二个任务：
+完成内存的初始规划，将ds、es、ss段寄存器都设置为0x9000，将sp设置为0xff00.
+设置完之后，栈顶地址就为`0x9ff00`了！
+
+##### 1.2.5.4 完成setup块的加载
+```s
+load_setup:                 
+    # 标签：加载setup程序的入口。
+    mov $0x0000, %dx        
+    # dx寄存器：指定磁盘驱动器和磁头
+    # dh = 0 (磁头0), dl = 0 (驱动器0，即第一个软盘)
+    mov $0x0002, %cx        
+    # cx寄存器：指定扇区和磁道
+    # ch = 0 (磁道0), cl = 2 (扇区2)；注：cx格式是高8位=磁道，低8位=扇区（低6位）
+    # 注释中“一共加载两块扇区”是最终要加载SETUPLEN个扇区，此处cx仅指定起始扇区
+    mov $0x0200, %bx        
+    # bx寄存器：指定数据加载到内存的偏移地址
+    # INITSEG（0x9000）是段地址，偏移0x200，最终物理地址=0x9000*16+0x200=0x90200
+    .equ AX, 0x0200+SETUPLEN 
+    # 定义常量AX：0x0200（读扇区功能号） + SETUPLEN（要读取的扇区数）
+    # 0x0200的高8位是功能号（0x02），低8位是扇区数（SETUPLEN）
+    mov $AX, %ax            
+    # ax寄存器：高8位=0x02（BIOS 0x13中断的读扇区功能），低8位=SETUPLEN（读取的扇区数）
+    int $0x13               
+    # 触发BIOS 0x13中断：执行磁盘读操作，将指定扇区加载到指定内存地址
+
+    jnc ok_load_setup       
+    # 检查CF（进位标志）：CF=0（无进位）表示读取成功，跳转到ok_load_setup
+    # CF=1表示读取失败，执行后续重置磁盘的逻辑
+    mov $0x0000, %dx        
+    # 重置dx为0（驱动器0，磁头0）
+    mov $0x0000, %ax        
+    # ax=0x0000：BIOS 0x13中断的0号功能（重置磁盘控制器）
+    int $0x13               
+    # 触发0x13中断：重置磁盘控制器，恢复磁盘初始状态
+    jmp load_setup          
+    # 跳回load_setup标签，重新尝试读取扇区（循环直到成功）
+```
+这是完成bootsect.s的**第3个功能**：**setup块的加载。**
+
+调用的是BIOS写在内存开始处的中断函数，int 13表示这是13号中断。功能就是加载磁盘的数据到指令内存位置处。
+
+
+##### 1.2.5.5 获取得到驱动器参数
+获取磁盘驱动器参数（每磁道扇区数）
+```s
+ok_load_setup:
+    # 第部分功能：获取磁盘驱动器参数（每磁道扇区数）
+    # 这一部分代码的唯一目标是：问 BIOS “软盘驱动器 0（A 盘）的每一个磁道里有多少个扇区”，然后把这个数字记下来，给后面读取磁盘数据用。
+    # Get disk drive parameters, specifically nr of sectors/track
+	mov	$0x00, %dl        
+    # DL寄存器：指定要查询的驱动器号，0x00表示第一个软盘驱动器(A:)
+	mov	$0x0800, %ax      
+    # AH=0x08（功能号），AL=0x00；BIOS 0x13中断的0x08号功能是获取驱动器参数
+	int	$0x13             
+    # 调用BIOS 0x13中断，执行"获取驱动器参数"功能
+	# 中断返回后：CX寄存器低6位=每磁道扇区数，CH=磁道号低8位，CL高2位=磁道号高2位
+	mov	$0x00, %ch      
+    # 将CH清零（只保留CL中的每磁道扇区数）
+	# seg cs                 
+    # 注释的伪指令，作用是指定后续操作的段寄存器为代码段CS
+	mov	%cx, %cs:sectors+0 
+    # 将CX的值（仅CL有效，每磁道扇区数）存入CS段的sectors变量，那么这个变量在哪里呢？在最后面的收尾(还可以这么玩，牛)
+	mov	$INITSEG, %ax 
+    # 将INITSEG（初始化段地址，如0x9000）加载到AX
+	mov	%ax, %es          
+    # 将AX的值赋给ES段寄存器，重置ES为初始化段
+```
+##### 1.2.5.6 打印启动的提示信息
+```s
+    # 第二部分：打印提示信息
+    # 这一部分代码的唯一目标是：打印提示信息"IceCityOS is booting ..."到屏幕上。
+	mov	$0x03, %ah        
+    # AH=0x03，BIOS 0x10中断的0x03号功能：读取光标位置
+	xor	%bh, %bh          
+    # BH=0，指定操作的显示页为第0页（默认显示页）
+	int	$0x10             
+    # 调用BIOS 0x10中断，读取光标位置（返回后：DH=行号，DL=列号）
+	
+	mov	$30, %cx          
+    # CX=30，指定要打印的字符串长度（msg1的字符数，这里也不是30啊，咋搞的？）
+	mov	$0x0007, %bx      
+    # BX=0x0007：BL=0x07（字符属性：黑底白字，正常显示），BH=0（显示页0）
+	#lea	msg1, %bp        
+    # 注释的指令：取msg1的有效地址到BP（等价于mov $msg1, %bp）
+	mov     $msg1, %bp       
+    # BP寄存器指向要打印的字符串msg1的起始地址
+	mov	$0x1301, %ax      
+    # AH=0x13（BIOS 0x10中断的0x13号功能：打印字符串），AL=0x01（打印后移动光标）
+	int	$0x10             
+    # 调用BIOS 0x10中断，打印msg1字符串到屏幕
+```
+##### 1.2.5.7 加载system块到内存中
+```s
+	mov	$SYSSEG, %ax
+    # .equ SYSSEG, 0x1000	
+    # 指出system块被加载的位置的段大小，0x1000
+	mov	%ax, %es		
+    # segment of 0x010000
+	call	read_it 
+    # 加载system模块
+	call	kill_motor 
+    # 给软盘断电，因为我们Linux0.11是从软盘启动的，现在软盘已加载完毕，不需要继续保持电机运行，加载完了后，os就跑在内存里面了，暂时不需要软盘了
+```
+
+这里实际上完成了bootsect.s的第4个功能，加载system模块到内存的0x1000处.当然了，这里仅仅是调用read_it，具体的实现还要在下面完成：
+
+##### 1.2.5.8 read_it完成具体的system加载实现
+
+功能：
+
+安全、分阶段地`将磁盘上的 system 二进制数据块加载到内存指定区域`，并通过`边界校验`、`地址初始化`、`加载完成判断`实现**可靠的内核加载**.
+
+```s
+read_it:
+	mov	%es, %ax 
+    # 确保是ax的值是0x0fff
+	test	$0x0fff, %ax
+    # 关键校验：检测es是否处于64KB内存边界
+    # test $0x0fff, %ax 是位与测试指令（仅做位运算，不修改操作数，只影响标志位），
+    # 0x0fff 是低 12 位全 1、高 4 位全 0 的掩码，作用是提取 ax（即 es）的低 12 位数据；
+    # 校验逻辑：若 es 处于 64KB 边界 → 低 12 位为 0 → 位与结果为 0；若未对齐 → 低 12 位非 0 → 位与结果非 0。
+die:	jne 	die	
+    # jne检测ZF位的，如果不相等就跳转，进入死循环die，相等就往下走。
+    # 所以这里确保了es一定是64KB的边界。
+	# 如果es对齐64KB了，走到这里，先将bx清零，确保从es:0开始加载。
+    xor 	%bx, %bx		
+
+rp_read:
+	mov 	%es, %ax
+ 	cmp 	$ENDSEG, %ax	
+    # 计算 ax - ENDSEG（仅修改 CPU 标志位，不改变ax和ENDSEG的原始值），目的是通过减法结果的特征（借位 / 无借位），让后续条件跳转指令（如jb）判断ax和ENDSEG的大小关系。	
+    # have we loaded all yet?
+	jb	ok1_read
+    # 无符号数比较的条件跳转指令，全称是 Jump if Below，直译是「如果（前者）大于（后者），则跳转」
+    # 这里就是判断es是否大于ENDSEG，大于就跳转，说明es已经加载完了。
+    # 如果没大于，就说明system块还没加载完。继续进入ok1_read加载。
+    # 所以我们看出，真正的加载操作是在ok1_read中进行的。
+	ret
+    # 加载完成后，继续返回到前面的read_it下面的指令，即call kill_motor。
+```
+
+##### 1.2.5.9 ok1_read计算本次可读取的扇区数，避免跨段内存溢出，为磁盘读取做准备
+好了，接下来我们看看ok1_read是**怎么加载system块的。**
+ok1_read：**计算本次可读取的扇区数，避免跨段内存溢出，为磁盘读取做准备**
+```s
+ok1_read:
+	mov	%cs:sectors+0, %ax  
+    # AX = 磁盘每磁道的总扇区数（sectors是预定义常量，存储在cs段）
+	sub	sread, %ax          
+    # AX = 本磁道剩余可读取扇区数 = 总扇区数 - 已读取扇区数(sread)
+	mov	%ax, %cx            
+    # CX 暂存 本磁道剩余扇区数
+	shl	$9, %cx             
+    # CX = 剩余扇区数 × 512 字节（1扇区=512字节，左移9位等价×512），即剩余扇区对应字节数
+	add	%bx, %cx            
+    # CX = 当前段内偏移(bx) + 剩余扇区字节数 → 预判本次读取后的内存偏移位置
+	jnc 	ok2_read            
+    # 若无进位（CF=0），说明预判偏移≤64KB（段内最大偏移0xFFFF），内存空间足够，跳ok2_read
+	je 	ok2_read            
+    # 若相等（ZF=1），说明预判偏移刚好=64KB，无溢出，跳ok2_read
+	# 若有进位（CF=1），说明内存空间不足，计算当前段内实际可容纳的扇区数
+	xor 	%ax, %ax            
+    # AX置0
+	sub 	%bx, %ax            
+    # AX = 0 - bx = 段内剩余可用字节数（64KB - bx，因段内偏移最大0xFFFF）
+	shr 	$9, %ax             
+    # AX = 剩余可用字节数 ÷ 512 → 计算当前段内可容纳的最大扇区数（右移9位等价÷512）
+```
+有关常量的定义如下：
+```s
+sread:	
+    .word 1+ SETUPLEN	
+    # sectors read of current track
+sectors:
+	.word 0
+```
+可见，我们ok_read1本质上也没有做出真正的读取操作，知识做了基本的判断，计算出本次可读取的扇区数，避免跨段内存溢出，为磁盘读取做准备而已。我们继续往下：
+
+##### 1.2.5.10 ok2_read完成具体的system加载实现
+```s
+ok2_read:
+	call 	read_track          
+    # 调用磁盘读轨函数，读取AX个扇区到es:bx，读取完成后AX返回实际读取的扇区数
+	mov 	%ax, %cx            
+    # CX 暂存 本次实际读取的扇区数
+	add 	sread, %ax          
+    # AX = 本磁道已读取扇区数 + 本次读取扇区数 → 更新已读扇区计数
+	cmp 	%cs:sectors+0, %ax  
+    # 比较：更新后的已读扇区数 和 本磁道总扇区数 → 判断本磁道是否读取完毕
+	jne 	ok3_read            
+    # 若不相等（本磁道未读完），跳ok3_read更新计数，继续加载本磁道数据
+	# 若相等（本磁道已读完），切换磁头/磁道，准备读取下一个磁道
+	mov 	$1, %ax             
+    # AX=1
+	sub 	head, %ax           
+    # AX = 1 - 磁头号(head) → 判断是否为当前磁道的最后一个磁头（0/1，软盘双磁头）
+	jne 	ok4_read            
+    # 若不相等（不是最后一个磁头），跳ok4_read切换磁头
+	incw    track              
+    # 若是最后一个磁头，磁道号(track)加1，切换到下一个磁道
+```
+
+##### 1.2.5.11 read_track实际读取动作
+```s
+read_track:
+    # 保存寄存器现场（AX/BX/CX/DX），避免破坏上层逻辑的寄存器值
+	push	%ax                 
+	push	%bx
+	push	%cx
+	push	%dx
+
+	# 初始化BIOS 0x13中断(02H)的入参：读磁盘扇区的核心参数
+	mov	track, %dx          # DX 暂存磁道号
+	mov	sread, %cx          # CX 暂存起始扇区号
+	inc	%cx                 # CX = 起始扇区号 + 1（BIOS 0x13中断要求扇区号从1开始计数，程序内从0开始）
+	mov	%dl, %ch            # CH = 磁道号的低8位（BIOS规定：CH存储磁道号0-79）
+	mov	head, %dx           # DX 暂存磁头号
+	mov	%dl, %dh            # DH = 磁头号（0/1，软盘双磁头，BIOS规定DH存储磁头号）
+	mov	$0, %dl             # DL = 磁盘驱动器号（0=软驱A，BIOS默认启动驱动器）
+	and	$0x0100, %dx        # 兼容处理：保证DH仅保留磁头号（bit8清0），避免参数错误
+	mov	$2, %ah             # AH = 02H → BIOS 0x13中断的功能号，表示「读磁盘扇区」
+	int	$0x13               # 调用BIOS 0x13中断，执行磁盘读取：将CX起始的AX个扇区，读取到es:bx内存
+    # 所以理所当然的，读取动作都是要采用int 0x13中断来实现的。
+	jc	bad_rt              # 若进位（CF=1），说明磁盘读取失败（如扇区损坏、磁头定位失败），跳bad_rt重试
+
+	# 读取成功，恢复寄存器现场并返回
+	pop	%dx                 # 逆序恢复DX（栈的先进后出特性）
+	pop	%cx
+	pop	%bx
+	pop	%ax
+	ret                     
+    # 返回上一级（ok2_read），AX保留实际读取的扇区数
+```
+
+##### 1.2.5.12 bad_rt磁盘读取失败重试
+```s
+bad_rt:	
+    mov	$0, %ax             # AH = 00H → BIOS 0x13中断的功能号，表示「复位磁盘驱动器」
+	mov	$0, %dx             # DL = 0 → 复位软驱A（与读取时的驱动器号一致）
+	int	$0x13               # 调用BIOS 0x13中断，复位磁盘驱动器：重置磁头到0磁道，恢复磁盘控制器状态
+	# 恢复寄存器现场（与read_track一致，保证重试时参数正确）
+	pop	%dx
+	pop	%cx
+	pop	%bx
+	pop	%ax
+	jmp	read_track          
+    # 跳回read_track，重新执行磁盘读取，直到成功
+```
+##### 1.2.5.13 ok4_read 切换磁头
+```s
+ok4_read:
+	mov	%ax, head           # 更新磁头号(head)：未读完则切换为另一个磁头，读完则重置为0
+	xor	%ax, %ax            # AX置0，代表下一个磁道从第0个扇区开始读取
+```
+
+##### 1.2.5.14 kill_motor 实现
+我们完成了read_it后，自然走到了kill_motor，关闭软盘驱动器马达。因为我们的操作系统已经从软盘上加载到内存中来了！自然无需再使之驱动了。
+
+至于这段代码的原理，我们不必深究，仅仅知道这是关闭马达的代码，就行了。
+
+```s
+kill_motor:
+	push	%dx
+	mov	$0x3f2, %dx
+	mov	$0, %al
+	outsb
+	pop	%dx
+	ret
+```
+##### 1.2.5.15 关闭马达后，走到加载内核结束后的收尾工作，初始化根文件系统设备号
+
+自动检测并**初始化根文件系统设备号**（root_dev）：为**后续内核挂载根文件系统**、**读取系统文件提供硬件设备标识**；
+
+```s
+    mov	%cs:root_dev+0, %ax  
+    # AX = 读取当前cs段中root_dev变量的初始值（根设备号，默认可能为0）
+    # 这里的值是root_dev=0x301
+    cmp	$0, %ax              
+    # 比较根设备号是否为0（0表示未手动定义根设备）
+    jne	root_defined         
+    # 若根设备号≠0（已手动指定），跳转到root_defined，无需自动检测
+
+    # 若根设备号=0（未定义），则根据软盘每磁道扇区数自动匹配对应容量的软盘设备号
+    mov	%cs:sectors+0, %bx   
+    # BX = 读取cs段中sectors变量值（软盘每磁道扇区数，硬件检测得到）
+    mov	$0x0208, %ax	        
+    # AX = 0x0208 → 对应1.2MB软盘的设备号（/dev/ps0，Linux 0.11预定义）
+    cmp	$15, %bx             
+    # 比较：是否为每磁道15扇区（1.2MB软盘的硬件特征）
+    je	root_defined         
+    # 若是，跳root_defined，确定根设备为1.2MB软盘
+
+    mov	$0x021c, %ax	        
+    # AX = 0x021c → 对应1.44MB软盘的设备号（/dev/PS0，Linux 0.11预定义）
+    cmp	$18, %bx             
+    # 比较：是否为每磁道18扇区（1.44MB软盘的硬件特征）
+    je	root_defined         
+    # 若是，跳root_defined，确定根设备为1.44MB软盘
+
+    undef_root:             
+    # 未识别到支持的软盘类型（无有效根设备）
+    jmp undef_root          
+    # 死循环，终止程序（无有效根设备则系统无法启动）
+    # 这里也明确了，没有操作系统后续找不到文件系统，那么系统无法运行，所以从这个角度来看，文件系统从操作系统中剥离出来单独考虑，是有道理的。
+
+    root_defined:           
+    # 根设备号已确定（手动指定/自动检测成功）
+    mov	%ax, %cs:root_dev+0  
+    # 将确定后的根设备号（AX）写回cs段的root_dev变量，完成初始化
+```
+常量是ROOT_DEV，root_dev是内存标记，我们将常量存在此内存标记处：
+当然这是结尾的工作了。
+```s
+root_dev:
+	.word ROOT_DEV
+```
+##### 1.2.5.16 跳转到setup块
+
+通过远跳转指令跳转到 setup 程序：结束 bootsect 的所有工作，将 CPU 执行控制权完全交给 setup 阶段，进入系统启动的下一个核心流程。
+
+```s
+	ljmp	$SETUPSEG, $0
+```
+这里就是bootsect块最后的阶段。
+
+---
+
+不过，我还是指出，后面定义的常量,揭示了读取磁盘的相关信息，具体来说，有：
+读取的量、读取磁头、读取磁道。如下：
+```s
+sread:	.word 1+ SETUPLEN	# sectors read of current track
+head:	.word 0			# current head
+track:	.word 0			# current track
+```
+
+
 
 ### 1.2.ROOT_DEV
+
+好了，现在我们的bootsect.s文件讲完了，我们也终于可以明白ROOT_DEV的含义了。
+
 ROOT_DEV：这是**内核内部使用的全局变量**，后续代码（如**挂载根文件系统 mount_root()**）会读取这个变量，来决定**去哪个磁盘分区上找 ls、cat等等 程序**。
 
-
+不过，既然ROOT_DEV在这里已经被定义为了0x301,为啥还要有开头的：
+```
+ROOT_DEV = ORIG_ROOT_DEV;
+```
+呢？
+我们通过查询得知，ORIG_ROOT_DEV定义在main.c中，定义为：
+```c
+#define ORIG_ROOT_DEV (*(unsigned short *)0x901FC)
+```
 
 ## 1.作用
 简单来说，这段赋值代码的作用是：从 `BIOS / 引导加载程序（Bootloader）`留下的 `“遗产”` 中，`读取用户指定的 “根文件系统设备号”`，并将其赋值给`内核全局变量 ROOT_DEV`。
