@@ -750,8 +750,6 @@ head:	.word 0			# current head
 track:	.word 0			# current track
 ```
 
-
-
 ### 1.3.ROOT_DEV
 
 好了，现在我们的bootsect.s文件讲完了，我们也终于可以明白ROOT_DEV的含义了。
@@ -831,3 +829,9 @@ ROOT_DEV = ORIG_ROOT_DEV;
 简单来说，这段赋值代码的作用是,将bootsect.s阶段定义的宏汇编ROOT_DEV的值的地址ORIG_ROOT_DEV ，解引用后赋值给ROOT_DEV。值的大小虽然不变，但是类型从汇编的short，变成了C的unsigned short。更加稳健。
 
 > 好了，你也看到了，我们只讲了一行代码，却用了几万字，这就是开支散叶的威力。这也说明，学习操作系统，一定要以主线来学习，不然，你都不知道从哪学起，串联不起来，注定也搞不懂。
+
+## 3. 内存架构
+经过我们bootsect.s文件后，我们的内存架构变为了：
+![执行完bootsect.s后的内存架构](../img/bootsect/执行完bootsect.s后的内存架构.png)
+
+>记住了，我们主线是main函数，辅线是内存架构。只有这样，我们才能真正明白操作系统在内存里面长啥样子。
