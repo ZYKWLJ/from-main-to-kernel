@@ -55,7 +55,7 @@ BIOS除了加载引导区外，还涉及了一些其他的功能，如：
 这是因为，system 内核编译链接时，**编译器 / 链接器默认内核会在 0x00000 运行**，因此**代码中所有的全局变量、函数调用、内存引用都是「基于 0x00000 的偏移地址」**（比如函数main的地址是 0x0000xxxx）。如果直接在 0x10000 运行，**内核会因为「地址引用错误」直接崩溃**（比如想访问 0x00001234，实际访问到 0x10000+0x1234，读取到垃圾数据）。
 
 
-### 2.2.3. 从16位实模式切换到32位保护模式(需要提前设置好GDT)。
+### 2.2.3. 从16位实模式切换到32位保护模式(需要提前设置好GDT+将CR0寄存器的PE位置1)。
 这是setup的关键，我们要把这点搞清楚不容易，慢慢来，先从CPU执行模式说起。
 
 什么是CPU的执行模式？**就是CPU如何获得数据的物理地址的？** 这个简简单单的问题，实际涉及了悠久的历史。
@@ -437,6 +437,11 @@ PDE 是**页目录表中的条目**，用于定位**页表**的**物理地址**�
 
 # 3. setup.S源码讲解
 
+好了，我们终于讲解完了setup的4个功能，在期间也解释了各个专业术语，例如实模式、保护模式、分页模式、GDT、LDT、TSS等等。
+现在，有了这些知识，我们终于可以从源码层面来查看这些功能的实现了！
+
+老规矩，先给出所有源码，再逐一讲解！
+
 ## 3.1 setup.S全部源码
 ```s
 	.code16
@@ -524,13 +529,13 @@ _start:
 	rep
 	movsb
 
-## modify ds
+# modify ds
 	mov $INITSEG,%ax
 	mov %ax,%ds
 	mov $SETUPSEG,%ax
 	mov %ax,%es
 
-##show cursor pos:
+#show cursor pos:
 	mov $0x03, %ah 
 	xor %bh,%bh
 	int $0x10
@@ -555,7 +560,7 @@ _start:
 	mov $0x1301, %ax
 	int $0x10
 
-##show detail
+#show detail
 	mov %ds:2 , %ax
 	call print_hex
 
@@ -766,3 +771,573 @@ enddata:
 .bss
 endbss:
 ```
+## 3.2 逐一精讲setup.S文件
+#### 3.2.1汇编形式的宏定义
+```s
+	.code16
+    # 告诉汇编器生成 16 位实模式代码。
+	.equ INITSEG, 0x9000	
+    # bootsect数据块的起始位置
+	.equ SYSSEG, 0x1000	
+    # system数据块的起始位置
+	.equ SETUPSEG, 0x9020	
+    # setup数据块的起始位置
+
+    # 注意上面这三条必须和bootsect.S中的定义一致，因为 bootsect 会将 setup 和 system 加载到这些位置。
+
+    # 定义全局符号，供链接器使用。
+	.global _start, begtext, begdata, begbss, endtext, enddata, endbss
+    # 声明代码段（.text）、数据段（.data）、未初始化数据段（.bss）的起止位置。
+
+	.text       # .text 是 GNU 汇编器（as）的伪指令，表示接下来的内容属于代码段（存放可执行指令，即编译好的机器码）。
+	begtext:    # begtext: 是一个标签，标记代码段的起始地址。通常，代码段是只读的，CPU 从这里取指令执行。
+	.data       # .data 表示接下来的内容是已初始化的数据段（存放程序中显式初始化的全局变量、静态变量等）。
+	begdata:    # begdata: 是数据段的起始标签。这部分数据在程序加载时会被写入内存的指定值（例如 int x = 42;）。
+	.bss        # .bss 表示未初始化的数据段（存放未显式初始化的全局变量、静态变量，如 int y;）。         
+	begbss:     # begbss: 是 BSS 段的起始标签。实际运行时，操作系统会将这段内存清零（因此不需要在文件中存储大量零值，节省空间）。其实，这个段的名字可以叫做：better save space=>BSS
+	.text       # .text重新切换回代码段，表示后续内容是代码（例如 _start 标签后的指令）。
+```
+
+#### 3.2.2 跳转到setup的_start标签处，开始执行setup代码
+```s
+    ljmp $SETUPSEG, $_start # 显然跳转到0x90200处开始执行。
+    # ljmp 是“长跳转”（long jump）的意思，允许跨段跳转。
+    # CS设置为了$SETUPSEG,为0x90200(setup.s的段)，IP设置为了$_start，从这里具体执行。
+```
+### 功能1：将重要的元信息，如光标位置等，文字显示模式等从0地址处复制到0x90000地址处。
+
+#### 3.2.3 setup的_start标签处的代码讲解
+总体来说，下面这段代码收集计算机**硬件核心信息并保存**、可视化展示这些信息，**同时做进入保护模式的前期准备**（检查硬盘、关闭中断、初始化内存搬运参数）。
+
+```s
+_start:
+
+# 将 CS 值复制到 DS 和 ES，使数据段和附加段指向当前代码段（方便后续访问数据）。
+	mov %cs,%ax
+	mov %ax,%ds
+	mov %ax,%es
+
+# print some message
+# 使用 BIOS int 0x10 显示字符串：
+# 先调用 AH=0x03 获取当前光标位置（用于后续保存）。
+# 然后 AH=0x13 是“写字符串”功能：
+# AL=0x01：字符串包含属性，光标移动。
+# BH=0：显示页 0。
+# BL=0x0b：浅青色前景，黑色背景。
+# CX=29：字符串长度。
+# BP=msg2：字符串地址。
+# 显示内容："Now we are in setup ..."
+	mov $0x03, %ah
+	xor %bh, %bh
+	int $0x10
+
+	mov $29, %cx
+	mov $0x000b,%bx
+	mov $msg2,%bp
+	mov $0x1301, %ax
+	int $0x10
+
+# 保存光标位置到 0x90000
+# 为啥能够知道光标位置？这是BIOS读取的硬件信息。知识屏蔽，我们可以不管。
+	mov	$INITSEG, %ax	# this is done in bootsect already, but...
+	mov	%ax, %ds
+	mov	$0x03, %ah	    # read cursor pos
+	xor	%bh, %bh
+	int	$0x10		    # save it in known place, con_init fetches
+	mov	%dx, %ds:0	    # it from 0x90000.
+
+# 保存内存大小（扩展内存，单位：KB），到 0x90002
+	mov	$0x88, %ah 
+	int	$0x15
+	mov	%ax, %ds:2
+
+# 将显卡信息分别存入 0x90004（页）和 0x90006（模式+宽度）。
+	mov	$0x0f, %ah
+	int	$0x10
+	mov	%bx, %ds:4	# bh = display page
+	mov	%ax, %ds:6	# al = video mode, ah = window width
+
+# 检查 EGA/VGA 并获取配置参数，存入 0x90008-0x9000c
+# 啥是 EGA/VGA？=> 是 IBM 公司开发的一种视频显示卡，支持 80x25 字符模式和 320x200 像素模式。
+	mov	$0x12, %ah
+	mov	$0x10, %bl
+	int	$0x10
+	mov	%ax, %ds:8
+	mov	%bx, %ds:10
+	mov	%cx, %ds:12
+
+# 获取硬盘 0（hd0）参数,将其从 BIOS 表复制到 0x90080。
+	mov	$0x0000, %ax
+	mov	%ax, %ds
+	lds	%ds:4*0x41, %si
+	mov	$INITSEG, %ax
+	mov	%ax, %es
+	mov	$0x0080, %di
+	mov	$0x10, %cx
+	rep
+	movsb
+
+# 获取硬盘 1（hd1）参数，将其从 BIOS 表复制到 0x90090。
+	mov	$0x0000, %ax
+	mov	%ax, %ds
+	lds	%ds:4*0x46, %si
+	mov	$INITSEG, %ax
+	mov	%ax, %es
+	mov	$0x0090, %di
+	mov	$0x10, %cx
+	rep
+	movsb
+
+# 恢复段寄存器为 INITSEG
+	mov $INITSEG,%ax
+	mov %ax,%ds
+	mov $SETUPSEG,%ax
+	mov %ax,%es
+
+# 显示光标位置
+	mov $0x03, %ah 
+	xor %bh,%bh
+	int $0x10
+	mov $11,%cx
+	mov $0x000c,%bx
+	mov $cur,%bp
+	mov $0x1301,%ax
+	int $0x10
+	mov %ds:0 ,%ax
+	call print_hex
+	call print_nl
+
+# 显示内存大小（扩展内存，单位：KB）
+	mov $0x03, %ah
+	xor %bh, %bh
+	int $0x10
+	mov $12, %cx
+	mov $0x000a, %bx
+	mov $mem, %bp
+	mov $0x1301, %ax
+	int $0x10
+	mov %ds:2 , %ax
+	call print_hex
+
+# 显示硬盘 0（hd0）参数的详细信息
+
+# 显示柱面
+	mov $0x03, %ah
+	xor %bh, %bh
+	int $0x10
+	mov $25, %cx
+	mov $0x000d, %bx
+	mov $cyl, %bp
+	mov $0x1301, %ax
+	int $0x10
+	mov %ds:0x80, %ax
+	call print_hex
+	call print_nl
+
+# 显示磁头
+	mov $0x03, %ah
+	xor %bh, %bh
+	int $0x10
+	mov $8, %cx
+	mov $0x000e, %bx
+	mov $head, %bp
+	mov $0x1301, %ax
+	int $0x10
+	mov %ds:0x82, %ax
+	call print_hex
+	call print_nl
+
+# 显示磁头扇区
+	mov $0x03, %ah
+	xor %bh, %bh
+	int $0x10
+	mov $8, %cx
+	mov $0x000f, %bx
+	mov $sect, %bp
+	mov $0x1301, %ax
+	int $0x10
+	mov %ds:0x8e, %ax
+	call print_hex
+	call print_nl
+
+# 检查是否存在 hd1
+
+	mov	$0x01500, %ax
+	mov	$0x81, %dl
+	int	$0x13
+	jc	no_disk1
+	cmp	$3, %ah
+	je	is_disk1
+
+no_disk1:
+	mov	$INITSEG, %ax
+	mov	%ax, %es
+	mov	$0x0090, %di
+	mov	$0x10, %cx
+	mov	$0x00, %ax
+	rep
+	stosb
+
+is_disk1:
+
+```
+### 功能2：将system模块从0x10000地址处复制到0x00000地址处。
+#### 3.2.4 关闭中断将system移动到0x00000
+```s
+    # 关中断并移动 system 代码到正确位置0x00000
+	cli			
+	mov	$0x0000, %ax
+	cld			
+
+    # 开始移动
+do_move:
+	mov	%ax, %es	# destination segment
+	add	$0x1000, %ax
+	cmp	$0x9000, %ax
+	jz	end_move
+	mov	%ax, %ds	# source segment
+	sub	%di, %di
+	sub	%si, %si
+	mov 	$0x8000, %cx
+	rep
+	movsw
+	jmp	do_move
+```
+
+#### 3.2.5 恢复移动后Linus的自嘲
+第一行语句中，写到`right, forgot this at first. didn't work :-)`，可见，即便强如linus，也有疏忽的时候。他记载自己最初漏掉了这步，导致 lgdt 加载了错误的 GDT 地址，系统崩溃，后来修复时自嘲“didn't work”。
+
+```s
+    # 结束移动
+end_move:
+	mov	$SETUPSEG, %ax	# right, forgot this at first. didn't work :-)， Linus 的注释：他最初可能漏掉了这步，导致 lgdt 加载了错误的 GDT 地址，系统崩溃，后来修复时自嘲“didn't work”。
+    
+	mov	%ax, %ds        # 恢复 DS = SETUPSEG。如果没有恢复 DS，后续的 lidt 和 lgdt 会错误地从 DS=0x9000 计算地址，导致加载错误的 GDT/IDT。
+
+    # lidt [idt_48]：加载 IDT（中断描述符表），初始为空（limit=0）。
+    # lgdt [gdt_48]：加载 GDT（全局描述符表），地址为 0x90200 + gdt。
+	lidt	idt_48		# load idt with 0,0
+	lgdt	gdt_48		# load gdt with whatever appropriate
+```
+
+#### 3.2.6 A20地址线的操作
+接下来进行如下操作：
+1️⃣ 开启 A20 地址线（突破 1MB 内存限制）
+2️⃣ 重编程 8259 中断控制器（避免 BIOS 中断冲突）
+3️⃣ 切换到保护模式（通过设置 CR0 寄存器）
+4️⃣ 跳转到内核入口点（32 位代码）
+
+```s
+# 开启A20地址线，本质就是向端口写数据(CPU操作其他设备的本质就是读写端口)
+
+	inb     $0x92, %al	# open A20 line(Fast Gate A20).
+	orb     $0b00000010, %al
+	outb    %al, $0x92
+
+# 实际上，这是较为现代化的操作，直接写端口，之前的传统操作如下，很复杂，而且还需要使用辅助函数empty_8042：
+	
+    #call	empty_8042	# 8042 is the keyboard controller
+	#mov	$0xD1, %al	# command write
+	#out	%al, $0x64
+	#call	empty_8042
+	#mov	$0xDF, %al	# A20 on
+	#out	%al, $0x60
+	#call	empty_8042
+
+# 背景：
+# BIOS 默认将硬件中断映射到 INT 0x08-0x0F，但这些与 CPU 内部异常（如 INT 0x0D 通用保护错误）冲突。
+# 需将硬件中断重映射到 INT 0x20-0x2F（避开异常）。
+
+	mov	$0x11, %al		# initialization sequence(ICW1)
+					# ICW4 needed(1),CASCADE mode,Level-triggered
+	out	%al, $0x20		# send it to 8259A-1
+	.word	0x00eb,0x00eb		# jmp $+2, jmp $+2
+	out	%al, $0xA0		# and to 8259A-2
+	.word	0x00eb,0x00eb
+	mov	$0x20, %al		# start of hardware int's (0x20)(ICW2)
+	out	%al, $0x21		# from 0x20-0x27
+	.word	0x00eb,0x00eb
+	mov	$0x28, %al		# start of hardware int's 2 (0x28)
+	out	%al, $0xA1		# from 0x28-0x2F
+	.word	0x00eb,0x00eb		#               IR 7654 3210
+	mov	$0x04, %al		# 8259-1 is master(0000 0100) --\
+	out	%al, $0x21		#				|
+	.word	0x00eb,0x00eb		#			 INT	/
+	mov	$0x02, %al		# 8259-2 is slave(       010 --> 2)
+	out	%al, $0xA1
+	.word	0x00eb,0x00eb
+	mov	$0x01, %al		# 8086 mode for both
+	out	%al, $0x21
+	.word	0x00eb,0x00eb
+	out	%al, $0xA1
+	.word	0x00eb,0x00eb
+	mov	$0xFF, %al		# mask off all interrupts for now( # 屏蔽所有中断, 后续由内核重新启用)
+	out	%al, $0x21
+	.word	0x00eb,0x00eb
+	out	%al, $0xA1
+```
+### 功能3：从16位实模式切换到32位保护模式(需要提前设置好GDT)。
+
+#### 3.2.7 切换到保护模式
+- 1.置PE位为1
+
+因为机器状态字寄存器关联着CPU的各种执行模式，所以，进入保护模式其实很简单，就是将CR0的最后一位(PE)置为1即可。
+
+- 2.在保护模式下跳转
+
+0x0008解释为0b1000，即(001:0 :00)，即GDT中第2个描述符(索引为1，从0开始，GDT第一个描述符为dummy)。
+
+```s
+    # 设置 CR0 的 PE 位
+    # CR0.PE=0：实模式。
+    # CR0.PE=1：保护模式（但此时仍在实模式代码段执行）。
+	mov	%cr0, %eax	# get machine status(cr0|MSW)	
+	bts	$0, %eax	# turn on the PE-bit 
+	mov	%eax, %cr0	# protection enabled
+
+    # 下面的动作，都是在保护模式下运行了	
+    # select for code segment 0 (001:0 :00)，显然，）0x0008就是1000，就是(001:0 :00), 就是GDT中的第一个段描述符。
+	.equ	sel_cs0, 0x0008 
+
+    # 远跳刷新流水线
+    # 保护模式下，CPU 的指令流水线仍需实模式解码，必须通过远跳转强制清空流水线，并开始使用 GDT 中的代码段描述符。
+    # 实际上，这段代码并没有做任何实际动作，仅仅做了远跳这个行为。
+	ljmp	$sel_cs0, $0	
+```
+#### 3.2.8 可以舍弃的键盘辅助函数。
+
+上面也说过，这是因为远古时期开启A20地址线比较复杂使用的辅助函数`empty_8042`，我们采用了更先进的端口方式，所以这里可有可无，就像定义一个函数没使用一样。
+
+```s
+empty_8042:
+	.word	0x00eb,0x00eb
+	in	$0x64, %al	# 8042 status port
+	test	$2, %al		# is input buffer full?
+	jnz	empty_8042	# yes - loop
+	ret
+```
+
+#### 3.2.9 定义GDT,idt_48,gdt_48指针
+
+这其实是功能3中调用到的数据，设置gdt、idt。
+
+> 前向声明？
+汇编中，没有前向声明这回事，前面的函数同样可以调用后面才声明的数据。 关键点：汇编器和链接器不关心符号的声明顺序，只关心符号的最终地址能否被正确计算。
+
+```s
+# 全局描述符表定义
+gdt:
+    # (1)这是 GDT 的第一个条目（索引 0），必须存在但无效（CPU 要求）。即dummy描述符。
+	.word	0,
+            0,
+            0,
+            0		
+    # (2) 代码段描述符（索引 1，选择子 0x0008）
+	.word	0x07FF		# 8Mb - limit=2047 (2048*4096=8Mb)
+	.word	0x0000		# base address=0
+	.word	0x9A00		# code read/exec
+	.word	0x00C0		# granularity=4096, 386
+    # (3) 数据段描述符（索引 2，选择子 0x0010）
+	.word	0x07FF		# 8Mb - limit=2047 (2048*4096=8Mb)
+	.word	0x0000		# base address=0
+	.word	0x9200		# data read/write
+	.word	0x00C0		# granularity=4096, 386
+
+# lgdt 和 lidt 指令需要从内存加载 6 字节指针（2 字节限长 + 4 字节基址）。
+
+# IDTR 加载指针
+idt_48:
+	.word	0			# idt limit=0 ,2字节限长
+	.word	0,0			# idt base=0L  ,4字节基址
+
+# GDTR 加载指针
+gdt_48:
+    # 限长
+	.word	0x800			# gdt limit=2048, 256 GDT entries   ,2字节限长
+
+    # 低16位为512+gdt；高16位，实际=0x9<<16。这里等价于两个word。
+	.word   512+gdt,0x9		# gdt base = 0X9xxxx    , 4字节基址
+```
+疑问：为啥lgdt 需要计算 512+gdt？
+gdt 的地址是相对于 setup.s 的偏移量（0x90200），而 512 是 gdt 在 setup.s 内部的偏移（见代码布局）。
+
+- 1.基址计算逻辑：
+0x9 是 INITSEG（0x9000 的段基址），`0x9 << 16 = 0x90000`。
+512 + gdt：
+gdt 是标签的文件内偏移（相对于 setup.s 起始位置 0x90200）。
+512 是 gdt 到 setup.s 开头的偏移，因此 512 + gdt = gdt 的绝对偏移。
+最终基址 = 0x90000 + 512 + gdt_offset
+
+- 2.那为啥这里需要计算 512+gdt？
+因为512=0x200，也就是setup相对于0x90000的偏移，这里相加，就得到了0x90000+0x200+gdt=0x90200+gdt,完美得到了gdt的绝对地址。
+
+
+#### 3.2.10 其他末尾打印辅助函数
+
+```s
+# 将 AX 以十六进制打印（4 位，每位调用 BIOS 打印）。
+print_hex:
+	mov $4,%cx
+	mov %ax,%dx
+
+print_digit:
+	rol $4,%dx	
+    # 循环以使低4位用上，高4位移至低4位
+	mov $0xe0f,%ax 
+    # ah ＝ 请求的功能值，al = 半个字节的掩码
+	and %dl,%al
+	add $0x30,%al
+	cmp $0x3a,%al
+	jl outp
+	add $0x07,%al
+
+outp:
+	int $0x10
+	loop print_digit
+	ret
+
+# 打印回车换行
+print_nl:
+	mov $0xe0d,%ax
+	int $0x10
+	mov $0xa,%al
+	int $0x10
+	ret
+```
+#### 3.2.11 一些数据字符常量定义
+```s
+# 一些数据字符常量定义
+msg2:
+	.byte 13,10
+	.ascii "Now we are in setup ..."
+	.byte 13,10,13,10
+cur:
+	.ascii "Cursor POS:"
+mem:
+	.ascii "Memory SIZE:"
+cyl:
+	.ascii "KB"
+	.byte 13,10,13,10
+	.ascii "HD Info"
+	.byte 13,10
+	.ascii "Cylinders:"
+head:
+	.ascii "Headers:"
+sect:
+	.ascii "Secotrs:"
+```
+
+- .ascii:
+
+.ascii 是 GNU 汇编器（as）的`伪指令`，用于在`目标文件中直接插入 ASCII 字符串数据`，它会将字符串的`每个字符以对应的 ASCII 码值存储到当前段`（如 .data 或 .rodata）中，**不会**自动添加字符串结束符 \0。
+
+
+
+#### 3.2.12 一些数据结束符定义
+好了，下面是最后的一些数据结束符定义。
+```s
+.text
+endtext:
+.data
+enddata:
+.bss
+endbss:
+```
+为了完整展现setup.S的代码布局，我们将开头的格式代码布局也加上：
+加上后，如下：
+```s
+	.code16
+	.equ INITSEG, 0x9000	 
+	.equ SYSSEG, 0x1000 
+	.equ SETUPSEG, 0x9020 
+
+	.global _start, begtext, begdata, begbss, endtext, enddata, endbss
+
+	.text
+	begtext:
+	.data
+	begdata:
+	.bss
+	begbss:
+	.text
+     # 正式的各种代码
+    .text
+    endtext:
+    .data
+    enddata:
+    .bss
+    endbss:
+```
+#### 3.2.13 GNU汇编器的段管理机制
+
+##### 疑问：
+这就是整个代码架构，不禁提问，为啥要这么架构？而且是不是出现了内存嵌套的感觉？比如begbss:和endbss:之间，包含了.text和endtext:，怎么说？
+
+
+##### 解答：
+
+1. GNU 汇编器的段管理机制
+
+（1）段切换的栈行为
+
+GNU 汇编器维护一个`当前段`（Current Section）的`栈`。每次用`伪指令`（如 .text/.data）`切换段时`，`旧的段会被压入栈`，后续可通过 `.previous` 返回。例如：
+
+```s
+    .text           # 当前段 = .text
+    .data           # 当前段 = .data，原 .text 压栈
+    .bss            # 当前段 = .bss，原 .data 压栈
+    .text           # 当前段 = .text，原 .bss 压栈
+```
+尽管代码中出现了 .bss 和 .text 的`交叉`，`但汇编器会按最后一次声明的 .text 作为当前段。`
+
+
+（2）标签（Label）的作用域
+
+标签（如 begbss:/endbss:）的地址是`相对于当前段`的。即使你在 .bss 段中写了一个 .text 声明，`标签仍绑定到最新的当前段`：
+```s
+    .bss
+    begbss:         # 地址 = 当前.bss段的偏移
+    .text
+    label_in_text:  # 地址 = 当前.text段的偏移
+```
+因此，begbss: 属于 .bss 段，endtext: 属于 .text 段，`不存在嵌套作用域。`
+
+2. setup.S的架构解析
+所以，上述 setup.S 的架构实际上是：
+```s
+    .text
+    begtext:        # 属于 .text 段
+    .data
+    begdata:        # 属于 .data 段
+    .bss
+    begbss:         # 属于 .bss 段
+    .text           # 切换回 .text 段（之前的 .bss 压栈）
+    ...             # 正式代码（属于 .text 段）
+    .text           # 无效操作（当前段已是 .text）
+    endtext:        # 属于 .text 段
+    .data
+    enddata:        # 属于 .data 段
+    .bss
+    endbss:         # 属于 .bss 段
+```
+
+# 4. 总结
+
+好了，我们的setup.S就结束了！
+我们从`前情回顾->功能实现及解释->源码讲解反扣功能`完成了setup.S的讲解。这也是我们后面的讲解源码的节奏。
+
+但是别忘了我们整本书的讲解节奏哦！**以main函数的每一行代码为骨干讲解**的！只不过在main之前，会经历bootloader！
+
+即：
+
+|节奏分类|具体工作|
+|-|-|
+|1.主线讲解节奏|main函数中的每一行代码|
+|2.辅线讲解节奏|内存的现状|
+|3.源码讲解节奏|前情回顾->功能实现及解释->源码讲解反扣功能|
+
+有了这个思想，我们再来看看setup.s执行结束后，内存是啥样的？
+
+如图：
+
+![setup.s执行完后，内存的架构](../img/setup/setup.s执行完后，内存的架构.png)
