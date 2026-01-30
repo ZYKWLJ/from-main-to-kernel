@@ -667,15 +667,21 @@ L6:
 
 #### 3.2.7.1 为啥main的函数参数有3个0？
 
-这是为了遵循 C函数调用约定（cdecl调用约定）
-
-历史原因：早期的Unix内核main函数确实有参数：
+main函数的声明是符合 Unix 传统的标准格式：
 ```c
-// 在某些Unix版本中
-void main(struct boot_params *bp, int argc, char **argv)
+int main(int argc, char *argv[], char *envp[]);
 ```
 而当初linus是基于unix标准的，所以保留了这3个参数。
 
+压栈后，main的压栈形象如下：
+```c
+栈（从高地址到低地址）：
+| 第三个参数 (envp=0) |
+| 第二个参数 (argv=0) |
+| 第一个参数 (argc=0) |
+| 返回地址 (L6)       |
+| main入口地址        |
+```
 好了，那我们先看看setup_paging的具体实现
 
 #### 3.2.7.2 setup_paging 分页机制初始化
