@@ -27,7 +27,7 @@ startup_32:
 	lss stack_start,%esp
 	xorl %eax,%eax
 1:	incl %eax		# check that A20 really IS enabled
-	movl %eax,0x000000	# loop forever if it isn't
+	movl %eax,0x000000	# loop forever if it isnt
 	cmpl %eax,0x100000
 	je 1b
 
@@ -142,6 +142,7 @@ after_page_tables:
 	pushl $L6		# return address for main, if it decides to.
 	pushl $main
 	jmp setup_paging
+
 L6:
 	jmp L6			# main should never return here, but
 				# just in case, we know what happens.
@@ -151,6 +152,7 @@ L6:
 int_msg:
 	.asciz "Unknown interrupt\n\r"
 .align 2
+
 ignore_int:
 	pushl %eax
 	pushl %ecx
@@ -231,7 +233,7 @@ idt_descr:
 .align 2
 .word 0
 gdt_descr:
-	.word 256*8-1		# so does gdt (not that that's any
+	.word 256*8-1		# so does gdt (not that thats any
 	.long gdt		# magic number, but it works for me :^)
 
 	.align 8
