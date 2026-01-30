@@ -1097,7 +1097,7 @@ end_move:
 	mov	%eax, %cr0	# protection enabled
 
     # 下面的动作，都是在保护模式下运行了	
-    # select for code segment 0 (001:0 :00)，显然，）0x0008就是1000，就是(001:0 :00), 就是GDT中的第一个段描述符。
+    # select for code segment 0 (001:0 :00)，显然，）0x0008就是1000，拆解段选择子，去掉后面的3为，得到就是1，就是(001:0 :00), 就是GDT中的第一个段描述符。
 	.equ	sel_cs0, 0x0008 
 
     # 远跳刷新流水线
@@ -1105,6 +1105,13 @@ end_move:
     # 实际上，这段代码并没有做任何实际动作，仅仅做了远跳这个行为。
 	ljmp	$sel_cs0, $0	# 跳转到0x000000,到head.s执行。
 ```
+>注意，这里的段寄存器里面存着段选择子，而段选择子的结构如下：
+
+![段选择子](../img/setup/段选择子.png)
+
+所以我们不能说段寄存器里面存着索引，只能说段寄存器里面存着段选择子，段选择子的前13位(或者去除后3位的结构)才是我们的描述符表的索引。
+
+>这也是我常常口误的地方，OS的设置不能出一点错！
 
 - 3.跳转到哪里？
 指令为：`ljmp	$sel_cs0, $0`
@@ -1271,12 +1278,12 @@ sect:
 #### 3.2.12 一些数据结束符定义
 好了，下面是最后的一些数据结束符定义。
 ```s
-.text
-endtext:
-.data
-enddata:
-.bss
-endbss:
+    .text
+    endtext:
+    .data
+    enddata:
+    .bss
+    endbss:
 ```
 为了完整展现setup.S的代码布局，我们将开头的格式代码布局也加上：
 加上后，如下：
@@ -1286,6 +1293,7 @@ endbss:
 	.equ SYSSEG, 0x1000 
 	.equ SETUPSEG, 0x9020 
 
+    # 各种符号必须先定义为了.golabl了，才能作为段内偏移地址的标记。
 	.global _start, begtext, begdata, begbss, endtext, enddata, endbss
 
 	.text
