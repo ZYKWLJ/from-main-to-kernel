@@ -65,10 +65,37 @@ void main(void)		/* This really IS void, no error here. */
 	for(;;) pause();
 }
 ```
-# 3.main函数的详细解析
+
+# 3.main函数的功能
+
+好了，有了main函数的全貌，我们再来梳理出他的功能，最后再逐个按照功能击破：
+main函数的功能如下：
+
+|功能| 
+|-|
+|1.挂载根文件系统|
+|2.设置硬盘驱动信息|
+|3.内存边界初始化|
+|4.缓存区边界初始化|
+|5.内存初始化|
+|6.块设备初始化|
+|7.字符设备初始化|
+|8.终端初始化|
+|9.时间初始化|
+|10.调度初始化|
+|11.缓存区初始化|
+|12.硬盘初始化|
+|13.软盘初始化|
+|14.开启中断|
+|15.移动到用户模式|
+|16.创建进程|
+|17.进程0怠速运行|
+
+
+# 4.main函数的详细解析
 为保证原汁原味，我们先从注释讲解。
-## 3.1 先解析所有注释
-### 3.1.1 第一处注释
+## 4.1 先解析所有注释
+### 4.1.1 第一处注释
 ```c
 void main(void)		/* This really IS void, no error here. */
 {			/* The startup routine assumes (well, ...) this */
@@ -78,7 +105,7 @@ void main(void)		/* This really IS void, no error here. */
 
 第二处注释含义为：由汇编跳转到这里。
 
-### 3.1.2 第二处注释
+### 4.1.2 第二处注释
 ```c
 /*
  * Interrupts are still disabled. Do necessary setups, then
@@ -90,7 +117,7 @@ void main(void)		/* This really IS void, no error here. */
 此时**中断还没有开启**，接下来要做一些**必要的初始化**，然后**再开启中断**。
 可预见，接下来会进行一系列初始化操作。
 
-### 3.1.3 第三处注释
+### 4.1.3 第三处注释
 ```c
 /*
  *   NOTE!!   For any other task 'pause()' would mean we have to get a
@@ -106,8 +133,8 @@ void main(void)		/* This really IS void, no error here. */
 
 >也就是task0是兜底的任务！这确保了**系统在没有其他任务可运行时，也能正常工作。**
 
-## 3.2 解析所有代码
-### 3.2.1 挂载根文件系统
+## 4.2 解析所有代码
+### 4.2.1 挂载根文件系统
 ```c
  	ROOT_DEV = ORIG_ROOT_DEV;
 ```
@@ -116,7 +143,7 @@ void main(void)		/* This really IS void, no error here. */
  
 [text](<第4章，ROOT_DEV = ORIG_ROOT_DEV.md#13root_dev>)
 
-### 3.2.2 获取硬盘参数
+### 4.2.2 获取硬盘参数
 ```c
  	drive_info = DRIVE_INFO;
 ```
