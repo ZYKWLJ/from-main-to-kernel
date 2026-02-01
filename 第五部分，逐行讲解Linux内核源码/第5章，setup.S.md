@@ -808,6 +808,7 @@ endbss:
 
 #### 3.2.3 setup的_start标签处的代码讲解
 总体来说，下面这段代码收集计算机**硬件核心信息并保存**、可视化展示这些信息，**同时做进入保护模式的前期准备**（检查硬盘、关闭中断、初始化内存搬运参数）。
+##### 3.2.3.1 打印提示字符
 
 ```s
 _start:
@@ -836,6 +837,10 @@ _start:
 	mov $msg2,%bp
 	mov $0x1301, %ax
 	int $0x10
+```
+
+##### 3.2.3.2 保存光标位置到 0x90000
+```s
 
 # 保存光标位置到 0x90000
 # 为啥能够知道光标位置？这是BIOS读取的硬件信息。知识屏蔽，我们可以不管。
@@ -845,18 +850,28 @@ _start:
 	xor	%bh, %bh
 	int	$0x10		    # save it in known place, con_init fetches
 	mov	%dx, %ds:0	    # it from 0x90000.
+```
 
+##### 3.2.3.3 保存保存内存大小到 0x90002
+
+```s
 # 保存内存大小（扩展内存，单位：KB），到 0x90002
 	mov	$0x88, %ah 
 	int	$0x15
 	mov	%ax, %ds:2
+```
+##### 3.2.3.4 保存显卡信息到 0x90004、0x90006
 
+```s
 # 将显卡信息分别存入 0x90004（页）和 0x90006（模式+宽度）。
 	mov	$0x0f, %ah
 	int	$0x10
 	mov	%bx, %ds:4	# bh = display page
 	mov	%ax, %ds:6	# al = video mode, ah = window width
+```
+##### 3.2.3.5 保存视频显示卡信息到 0x90008-0x9000c
 
+```s
 # 检查 EGA/VGA 并获取配置参数，存入 0x90008-0x9000c
 # 啥是 EGA/VGA？=> 是 IBM 公司开发的一种视频显示卡，支持 80x25 字符模式和 320x200 像素模式。
 	mov	$0x12, %ah
@@ -865,7 +880,10 @@ _start:
 	mov	%ax, %ds:8
 	mov	%bx, %ds:10
 	mov	%cx, %ds:12
+```
+##### 3.2.3.6 获取硬盘 0（hd0）参数,将其从 BIOS 表复制到 0x90080
 
+```s
 # 获取硬盘 0（hd0）参数,将其从 BIOS 表复制到 0x90080。
 	mov	$0x0000, %ax
 	mov	%ax, %ds
@@ -876,7 +894,9 @@ _start:
 	mov	$0x10, %cx
 	rep
 	movsb
-
+```
+##### 3.2.3.7 获取硬盘 1（hd1）参数,将其从 BIOS 表复制到 0x90090
+```s
 # 获取硬盘 1（hd1）参数，将其从 BIOS 表复制到 0x90090。
 	mov	$0x0000, %ax
 	mov	%ax, %ds
@@ -887,13 +907,19 @@ _start:
 	mov	$0x10, %cx
 	rep
 	movsb
+```
 
+##### 3.2.3.8 恢复段寄存器为 INITSEG
+```s
 # 恢复段寄存器为 INITSEG
 	mov $INITSEG,%ax
 	mov %ax,%ds
 	mov $SETUPSEG,%ax
 	mov %ax,%es
+```
+##### 3.2.3.9 显示光标位置
 
+```s
 # 显示光标位置
 	mov $0x03, %ah 
 	xor %bh,%bh
@@ -906,7 +932,10 @@ _start:
 	mov %ds:0 ,%ax
 	call print_hex
 	call print_nl
+```
 
+##### 3.2.3.10 显示内存大小 
+```s
 # 显示内存大小（扩展内存，单位：KB）
 	mov $0x03, %ah
 	xor %bh, %bh
@@ -918,7 +947,10 @@ _start:
 	int $0x10
 	mov %ds:2 , %ax
 	call print_hex
+```
 
+##### 3.2.3.11 显示硬盘 0（hd0）参数的详细信息
+```s
 # 显示硬盘 0（hd0）参数的详细信息
 
 # 显示柱面
@@ -959,7 +991,10 @@ _start:
 	mov %ds:0x8e, %ax
 	call print_hex
 	call print_nl
+```
 
+##### 3.2.3.12 检查是否存在 hd1
+```s
 # 检查是否存在 hd1
 
 	mov	$0x01500, %ax
@@ -981,6 +1016,7 @@ no_disk1:
 is_disk1:
 
 ```
+
 ### 功能2：将system模块从0x10000地址处复制到0x00000地址处。
 #### 3.2.4 关闭中断将system移动到0x00000
 ```s
