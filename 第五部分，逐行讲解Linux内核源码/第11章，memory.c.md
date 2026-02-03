@@ -78,6 +78,7 @@ static inline void oom(void)
 
 
 ### 1.2.4 CODE_SPACE(addr) 
+
 >作用：判断线性地址是否在代码空间。
 
 ```c
@@ -85,7 +86,14 @@ static inline void oom(void)
 current->start_code + current->end_code)
 ```
 
+这里应该是Linux0.11的BUG，在0.12里面，就改成了:
 
+```c
+#define CODE_SPACE(addr) ((((addr)+4095)&~4095) < \
+ current->end_code)
+```
+
+因为如果不是end_code，这里说不过去。
 
 ### 1.2.5 copy_page(from,to) 
 
@@ -120,13 +128,6 @@ current->start_code + current->end_code)
 ### 1.2.18 void mem_init(long start_mem, long end_mem)
 
 ### 1.2.19 void calc_mem(void)
-
- 
-
-
-
-
-
 
 
 
