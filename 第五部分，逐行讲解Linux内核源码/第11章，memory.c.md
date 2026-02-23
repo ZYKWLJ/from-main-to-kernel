@@ -252,6 +252,7 @@ __asm__(
 ### 1.2.7 void free_page(unsigned long addr)
 
 #### 1.2.7.1 作用
+
 > 释放**物理页** `addr`，并将其**标记为空闲**。如果 `addr` 不是**有效物理页地址**，则**panic**。
 
 #### 1.2.7.2 代码实现
@@ -281,14 +282,203 @@ void free_page(unsigned long addr)
 }
 ```
 ### 1.2.8 int free_page_tables(unsigned long from,unsigned long size)
+#### 1.2.8.1 作用
+>释放从指定**起始地址from**开始的连续的**size个页表**及其对应的页面。
 
+#### 1.2.8.2 代码实现
+```c
+/*
+ * This function frees a continuos block of page tables, as needed
+ * by 'exit()'. As does copy_page_tables(), this handles only 4Mb blocks.
+ */
+int free_page_tables(unsigned long from,unsigned long size)
+{
+	unsigned long *pg_table;//pg_table用于指向当前要释放的页表。
+	unsigned long * dir, nr;//dir指向页目录项，nr表示循环计数。
 
+    //检查起始地址from的低 22 位是否全为 0（0x3fffff是低 22 位全为 1 的掩码），如果不是则说明地址对齐不正确，调用panic函数并输出错误信息。
+    //为啥是22位，为啥要对齐？
+    //22位是因为2^22=4MB,每个页表项占用4字节，每个页表有1024个页表项，所以每个页表占用4MB。所以，这里检查对齐是为了确保from是4MB的整数倍。
+
+	if (from & 0x3fffff) 
+        //对齐出错
+		panic("free_page_tables called with wrong alignment");
+	if (!from)
+        //如果from为0，说明没有要释放的页表了，直接返回0。
+		panic("Trying to free up swapper memory space");
+    size = (size + 0x3fffff) >> 22;
+    //将大小size加上0x3fffff后右移 22 位，这是为了将大小转换为以 4MB 块为单位（因为 4MB = 2^22 字节）。
+    //相当于除以4MB[向下取整]，得到要释放的页表数量。
+	dir = (unsigned long *) ((from>>20) & 0xffc); /* _pg_dir = 0 */
+    //为啥是from>>20，为啥是0xffc？
+    //0xffc是111111111100，用来做与操作，将低 2 位清零，保证地址对齐，同时保留页目录索引部分。
+    //这里为啥是这样做？((from>>20) & 0xffc)?
+    //线性地址通常被分为三个部分：页目录索引（10 位）、页表索引（10 位）和页内偏移（12 位），总共 32 位。右移 20 位（from >> 20）可以得到页目录索引部分+多出2位用来做对齐。
+    /*
+    32位线性地址转化为页表地址的结构
+    |*12位*|*10位*|*10位*|
+    即
+    |*页目录/页表索引*|*页表项索引*|*页内偏移*|
+    */
+    //通过与 0xffc 与操作，将低 2 位清零，保证地址对齐，同时保留页目录索引部分。
+    //最终得到的是页目录项dir的物理地址的4倍。
+
+	for ( ; size-->0 ; dir++) {//开启循环，每次循环后size减1，dir指针指向下一个目录项。
+		if (!(1 & *dir))
+            continue;
+        //检查当前页表项的值的最低位是否为 1，如果是则说明该页表项对应的页面已分配，调用free_page函数释放该页面（通过与0xfffff000进行与操作得到页面的物理地址）。如果最低位不是 1，则说明该页表项未分配，直接继续下一次循环。
+        //注意，*dir得到项结构是：
+        /*
+                    页目录项格式：
+            31                    12 11    9 8 7 6 5 4 3 2 1 0
+            +----------------------+--------+-+-+-+-+-+-+-+-+-+
+            | 页表物理地址高20位    | AVL   |0|0|0|A|0|0|U|W|P|
+            +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        */
+        //这里最后一位就是P位，用来表示页面是否被加载到内存中。如果为1，说明页面已加载，需要释放。
+		pg_table = (unsigned long *) (0xfffff000 & *dir);
+        //如果目录项有效，从目录项中提取页表的物理地址（通过与0xfffff000进行与操作），并将其转换为指针类型赋给pg_table。得到高20位，即页表的物理地址高20位。
+
+		for (nr=0 ; nr<1024 ; nr++) {   //开始一个内层循环，用于遍历页表中的 1024 个项（因为每个页表项对应一个页面）。
+			if (1 & *pg_table)          //检查当前页表项的值的最低位是否为 1，如果是则说明该页表项对应的页面已分配，调用free_page函数释放该页面（通过与0xfffff000进行与操作得到页面的物理地址）。
+				free_page(0xfffff000 & *pg_table);
+			*pg_table = 0;              //将当前页表项的值设为0，即清空该页表项。
+			pg_table++;                 //将当前页表项设置为 0，表示该页面已释放或未使用。
+		}
+		free_page(0xfffff000 & *dir);   //释放页目录项对应的页面。
+		*dir = 0;                      //将当前页目录项的值设为0，即清空该页目录项。
+	}
+	invalidate();//调用invalidate函数，可能用于使缓存等无效，确保内存状态的一致性。
+	return 0;
+}
+```
 ### 1.2.9 int copy_page_tables(unsigned long from,unsigned long to,long size)
+#### 1.2.9.0 函数功能
 
+>复制从指定**起始地址from**开始的连续的**size个页表及其对应的页面**到以**to地址**为起始地址的**连续内存区域。**
+
+#### 1.2.9.1 代码实现
+```c
+/*
+1、这是内存管理（mm）中最复杂的函数之一，它通过仅复制页面来复制一系列线性地址。
+2、注意！我们不是复制任意内存块，地址必须能被 4MB 整除（一个页目录项），这使函数更简单。反正它只被fork使用。
+3、注意 2！！当from等于 0 时，我们在第一次fork时复制内核空间。我们不想复制一整个页目录项，因为那会导致严重的内存浪费，我们只复制前 160 页 - 640kB。即便这比我们实际需要的多，但它不会占用更多内存，因为在低 1MB 范围内我们不使用写时复制，所以这些页面可以与内核共享。这就是nr为特定值的特殊情况。
+ */
+int copy_page_tables(unsigned long from,unsigned long to,long size)
+                    //源线性地址from、目标线性地址to和要复制的内存范围大小
+{
+	unsigned long * from_page_table;//声明一个指向无符号长整型的指针，用于指向源页表。
+	unsigned long * to_page_table;  //声明一个指向无符号长整型的指针，用于指向目标页表。
+	unsigned long this_page;        //声明一个无符号长整型变量，用于临时存储当前处理的页面相关信息。
+	unsigned long * from_dir, * to_dir;//声明两个指向无符号长整型的指针，分别用于指向源页目录和目标页目录。
+	unsigned long nr; //声明一个无符号长整型变量，用于循环计数等用途。
+
+	if ((from&0x3fffff) || (to&0x3fffff))
+        //检查源地址from和目标地址to的低 22 位是否全为 0（0x3fffff是低 22 位全为 1 的掩码），如果不是则说明地址对齐不正确，调用panic函数并输出错误信息。
+		panic("copy_page_tables called with wrong alignment");
+	from_dir = (unsigned long *) ((from>>20) & 0xffc); /* _pg_dir = 0 */
+    //得到源页目录项的物理地址的4倍，将其转换为指针类型赋给from_dir。
+	to_dir = (unsigned long *) ((to>>20) & 0xffc);
+    //得到目标页目录项的物理地址的4倍，将其转换为指针类型赋给to_dir。
+	size = ((unsigned) (size+0x3fffff)) >> 22;
+    //将要复制的内存范围大小(size)右移 22 位，得到要复制的页目录项数量。
+	for( ; size-->0 ; from_dir++,to_dir++) {
+		if (1 & *to_dir)
+            //检查目标页目录项对应的最低位是否为 1，如果是，说明目标位置已经存在内容，调用panic函数并输出错误信息。
+			panic("copy_page_tables: already exist");
+		if (!(1 & *from_dir))
+            //检查源页目录项对应的最低位是否为 0，如果是，说明源页目录项对应的页表不存在或未使用，直接继续下一次循环。
+			continue;
+		from_page_table = (unsigned long *) (0xfffff000 & *from_dir);//得到高20位
+        //从源页目录项中提取源页表的物理地址（通过与0xfffff000进行与操作），并将其转换为指针类型赋给from_page_table。
+		if (!(to_page_table = (unsigned long *) get_free_page()))
+			return -1;	/* Out of memory, see freeing */
+        //调用get_free_page函数分配一个新的页面作为目标页表，如果分配失败（返回0），则返回 -1 表示内存不足。
+		*to_dir = ((unsigned long) to_page_table) | 7;
+        //将分配的目标页表的物理地址与标志位（7，表示页面存在、可读写、用户访问）进行按位或运算，并将结果赋值给目标页目录项，表示该页目录项现在指向一个有效的页表。
+        /*
+                    页目录项格式：
+            31                    12 11    9 8 7 6 5 4 3 2 1 0
+            +----------------------+--------+-+-+-+-+-+-+-+-+-+
+            | 页表物理地址高20位    | AVL   |0|0|0|A|0|0|U|W|P|
+            +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        */		
+        nr = (from==0)?0xA0:1024;//第一个是16进制的10*16=160页，第二个是1024页
+        //如果源地址from为0（特殊情况，第一次fork时复制内核空间），则设置nr为0xA0（160），否则设置nr为1024（正常情况下每个页表有1024个页表项）。
+        //这里页一目了然了，如果是第一个页目录项，我们只复制前 160 页 - 640kB。剩下的全部复制完成的页表4MB。
+		for ( ; nr-- > 0 ; from_page_table++,to_page_table++) {//同时from_page_table和to_page_table指针分别指向下一个源页表项和目标页表项。
+			this_page = *from_page_table;   //将当前源页表项的值赋给this_page变量。
+			if (!(1 & this_page))           //检查源页表项对应的最低位是否为 0，如果是，说明该页表项对应的页面不存在或未使用，直接继续下一次循环。
+				continue;
+			this_page &= ~2;                //将this_page的第 1 位（写保护位）清零，表示该页面暂时可读写。
+			*to_page_table = this_page;     //将修改后的this_page值赋给目标页表项，表示目标页表项现在指向与源页表项相同的页面，但暂时不受写保护。
+             /*
+                        页表项格式：
+                31                    12 11    9 8 7 6 5 4 3 2 1 0
+                +----------------------+--------+-+-+-+-+-+-+-+-+-+
+                | 页面物理地址高20位     | AVL   |0|0|0|A|0|W|U|P|
+                +----------------------+--------+-+-+-+-+-+-+-+-+-+
+            */
+
+			if (this_page > LOW_MEM) {
+				*from_page_table = this_page;
+				this_page -= LOW_MEM;
+				this_page >>= 12;//右移 12 位，得到该页面在mem_map数组中的索引。
+				mem_map[this_page]++;//将mem_map数组中对应页面的引用计数加1。
+			}
+		}
+	}
+	invalidate();//调用invalidate函数，可能用于使缓存等无效，确保内存状态的一致性。
+	return 0;
+}
+```
 
 
 ### 1.2.10 unsigned long put_page(unsigned long page,unsigned long address)
 
+#### 1.2.10.1 作用
+
+>将一个**物理页**(page)放置在**内存中指定的线性地址**(address)处，并返回**该页的物理地址**。
+如果内存不足（无论是访问**页表**还是**页面**时），则返回 0。
+
+#### 1.2.10.2 代码实现
+```c
+/*
+ * This function puts a page in memory at the wanted address.
+ * It returns the physical address of the page gotten, 0 if
+ * out of memory (either when trying to access page-table or
+ * page.)
+ */
+unsigned long put_page(unsigned long page,unsigned long address)
+//page表示要放置的页面的物理地址，address表示期望放置页面的线性地址。
+{
+	unsigned long tmp, *page_table;
+    //tmp，用于临时存储获取到的空闲页面地址；
+    //page_table，用于指向页表。
+
+/* NOTE !!! This uses the fact that _pg_dir=0 */
+
+	if (page < LOW_MEM || page >= HIGH_MEMORY)
+		printk("Trying to put page %p at %p\n",page,address);
+    //检查物理地址的有效性。
+	if (mem_map[(page-LOW_MEM)>>12] != 1)
+		printk("mem_map disagrees with %p at %p\n",page,address);
+    //检查mem_map数组中对应页面的引用计数是否不为 1.
+	page_table = (unsigned long *) ((address>>20) & 0xffc);
+    //通过将线性地址address右移 20 位并与0xffc（低 2 位为 0）进行与操作，得到页目录项的地址，并将其转换为指针类型赋给page_table。这一步是为了定位与目标线性地址对应的页表。
+	if ((*page_table)&1)//页表是否存在。
+		page_table = (unsigned long *) (0xfffff000 & *page_table);//如果页表已存在，从页目录项中提取页表的物理地址（通过与0xfffff000进行与操作），并将page_table指向该页表。
+	else {
+		if (!(tmp=get_free_page()))//调用get_free_page函数获取一个空闲页面，将返回的地址存储在tmp中。如果获取失败（tmp为 0）。
+			return 0;
+		*page_table = tmp|7;//如果获取到空闲页面，将其地址存储在页目录项中，并设置一些标志位（| 7可能设置了页表存在、可读可写等标志，具体取决于系统定义）。
+		page_table = (unsigned long *) tmp;//将page_table指向新分配的页表。
+	}
+	page_table[(address>>12) & 0x3ff/*10位*/] = page | 7;//计算目标线性地址在页表中的索引（(address>>12) & 0x3ff），并在页表的对应项中存储要放置的页面的物理地址page，同时设置一些标志位（| 7）。
+    /* no need for invalidate */
+	return page;//返回放置的页面的物理地址，表示操作成功。
+}
+```
 ### 1.2.11 void un_wp_page(unsigned long * table_entry)
 
 ### 1.2.12 void do_wp_page(unsigned long error_code,unsigned long address)
