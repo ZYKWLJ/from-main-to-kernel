@@ -189,7 +189,12 @@ struct task_struct {
 > 由此看出，这就是C中的嵌入式汇编语句的威力。实质上，**这是gcc的标准，专门用来这么实现的！**
 
 ### 1.2.6 unsigned long get_free_page(void)
-#### 1.2.6.1 代码实现
+#### 1.2.6.1 作用
+> 从**内存**中分配一个**空闲页面（物理页）**，并将其**标记为已用**。如果没有空闲页面可用，则返回 0。
+
+>本质上是从内存管理的 `mem_map` 数组中**查找并返回**一个**空闲页面的物理地址**。
+
+#### 1.2.6.3 代码实现
 ```c
 /*
  * Get physical address of first (actually last :-) free page, and mark it
@@ -200,34 +205,81 @@ unsigned long get_free_page(void)
 {
     // 1.绑定寄存器
 register unsigned long __res asm("ax");//这里是一个寄存器eax，用来存储返回值
-    // 2. 内嵌汇编核心逻辑
 
-__asm__("std ; repne ; scasb\n\t"
-	"jne 1f\n\t"
-	"movb $1,1(%%edi)\n\t"
-	"sall $12,%%ecx\n\t"
-	"addl %2,%%ecx\n\t"
-	"movl %%ecx,%%edx\n\t"
-	"movl $1024,%%ecx\n\t"
-	"leal 4092(%%edx),%%edi\n\t"
-	"rep ; stosl\n\t"
-	" movl %%edx,%%eax\n"
-	"1: cld"
-	:"=a" (__res)
-	:"0" (0),"i" (LOW_MEM),"c" (PAGING_PAGES),
-	"D" (mem_map+PAGING_PAGES-1)
+    // 2. 内嵌汇编核心逻辑
+__asm__(
+    "std ;     //std：设置方向标志位（DF），使字符串操作指令按从高地址到低地址的方向进行。
+
+    repne ;     //repne：重复执行后面的指令，直到ZF标志位为 1 或者计数器CX为 0。
+
+    scasb\n\t"  //scasb：从ES:[EDI]指向的内存单元中读取一个字节，并与AL寄存器中的值进行比较，设置标志位。这里是在扫描mem_map数组（EDI指向mem_map + PAGING_PAGES - 1）。
+
+	"jne 1f\n\t"//如果上一条scasb指令执行后ZF标志位不为 1（即没有找到值为 0 的字节），则跳转到标号1处（也就是没有空闲页面的情况）。
+
+	"movb $1,1(%%edi)\n\t"//如果找到了值为 0 的字节（表示找到空闲页面），将edi指向的下一个字节（mem_map中对应页面的标志位）设置为 1，表示该页面已被使用。
+
+	"sall $12,%%ecx\n\t"//将cx寄存器的值左移 12 位。因为页面大小是 4096 字节（2 的 12 次方），这里是计算页面的物理地址偏移量。
+
+	"addl %2,%%ecx\n\t"//将LOW_MEM（第二个输入操作数）加到cx寄存器中，得到页面的物理地址的一部分。
+
+	"movl %%ecx,%%edx\n\t"//将cx寄存器的值复制到edx寄存器中，保存页面的物理地址的一部分。
+
+	"movl $1024,%%ecx\n\t"//将cx寄存器设置为 1024，可能是用于后续的循环操作（这里可能是填充页面相关的操作）。
+
+	"leal 4092(%%edx),%%edi\n\t"//计算edi的值为edx + 4092，可能是指向要填充的页面的起始位置。
+
+	"rep ; stosl\n\t"//重复执行stosl指令，将eax寄存器中的值（这里应该是 0，因为没有明确设置其他值）存储到ES:[EDI]指向的内存区域中，共执行cx（1024）次，可能是用于初始化页面内容。
+
+	" movl %%edx,%%eax\n"//将edx寄存器中的值（页面的物理地址的一部分）复制到eax寄存器中，作为函数的返回值（__res绑定到ax）。
+
+	"1: cld"//标号1处，清除方向标志位（DF），恢复字符串操作的默认方向（从低地址到高地址）。
+    //输出约束
+	:
+    "=a" (__res)//指定eax寄存器（对应__res变量）作为输出。
+    // 输入约束：
+    :
+    "0" (0),// "0" (0)：将常数 0 作为第一个输入操作数=
+    "i" (LOW_MEM),// "i" (LOW_MEM)：将LOW_MEM作为立即数输入。
+    "c" (PAGING_PAGES),// "c" (PAGING_PAGES)：将PAGING_PAGES作为cx寄存器的输入。
+	"D" (mem_map+PAGING_PAGES-1)// "D" (mem_map + PAGING_PAGES - 1)：将mem_map + PAGING_PAGES - 1作为edi寄存器的输入。
+
 	);
-return __res;
+    return __res;//返回计算得到的空闲页面的物理地址（如果有的话），如果没有空闲页面则返回 0（因为在jne 1f分支中没有设置__res的值，所以默认是 0）。
+
 }
 ```
-#### 1.2.6.2 作用
-> 从**内存**中分配一个**空闲页面（物理页）**，并将其**标记为已用**。如果没有空闲页面可用，则返回 0。
-
-#### 1.2.6.3 实现原理
-> 从内存管理的 `mem_map` 数组中**查找并返回**一个**空闲页面的物理地址**。如果没有空闲页面，返回 0。
 
 ### 1.2.7 void free_page(unsigned long addr)
 
+#### 1.2.7.1 作用
+> 释放**物理页** `addr`，并将其**标记为空闲**。如果 `addr` 不是**有效物理页地址**，则**panic**。
+
+#### 1.2.7.2 代码实现
+```c
+/*
+ * Free a page of memory at physical address 'addr'. Used by
+ * 'free_page_tables()'
+ */
+void free_page(unsigned long addr)
+{
+	if (addr < LOW_MEM) return;//检查要释放的页面地址是否小于LOW_MEM（低内存边界）。如果是，说明该地址不在可管理的内存范围内，直接返回，不进行任何操作。
+
+	if (addr >= HIGH_MEMORY)//检查要释放的页面地址是否大于等于HIGH_MEMORY（高内存边界）。是的话，直接panic
+
+		panic("trying to free nonexistent page");
+
+    //两个范围内的都排除了，剩下的，就是正确范围中的了！
+	addr -= LOW_MEM;//如果页面地址在有效范围内（大于等于LOW_MEM且小于HIGH_MEMORY），将地址减去LOW_MEM，得到相对于低内存起始地址的偏移量。
+
+    //将偏移量右移 12 位。因为页面大小是 4096 字节（2 的 12 次方），这样做是为了得到该页面在mem_map数组中的索引。
+	addr >>= 12;
+    //检查mem_map数组中对应索引位置的页面引用计数,统一减少。如果减少前不为0，那么直接return。
+	if (mem_map[addr]--) return;
+    //如果减少前为0，那么此时就为-1了，不应该，所以这里需要重新设置为0.并在下面的panic中提示错误。表示释放了一个已经空闲的页面。
+	mem_map[addr]=0;
+	panic("trying to free free page");
+}
+```
 ### 1.2.8 int free_page_tables(unsigned long from,unsigned long size)
 
 
