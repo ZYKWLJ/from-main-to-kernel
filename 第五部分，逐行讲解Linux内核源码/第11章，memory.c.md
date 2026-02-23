@@ -85,15 +85,75 @@ static inline void oom(void)
 #define CODE_SPACE(addr) ((((addr)+4095)&~4095) < \
 current->start_code + current->end_code)
 ```
-
-这里应该是Linux0.11的BUG，在0.12里面，就改成了:
-
+#### 1.2.4.1 进程任务结构体讲解
+这里的`current->start_code`和`current->end_code`分别是指啥？
+首先，current是指的当前进程的任务结构体。具体实现如下：
 ```c
-#define CODE_SPACE(addr) ((((addr)+4095)&~4095) < \
- current->end_code)
+struct task_struct {
+/* these are hardcoded - don't touch */
+	long state;	    /* -1 unrunnable, 0 runnable, >0 stopped */
+                    //进程状态：标记进程当前的运行状态，决定调度器是否可选择该进程
+	long counter;   //剩余时间片，实现时间片轮转调度的核心字段
+	long priority;  //优先级。优先级越高，初始时间片越长
+	long signal;    //未处理信号位图：标记进程收到但尚未处理的信号
+	struct sigaction sigaction[32];//信号处理动作数组：定义每个信号的“处理方式”
+	long blocked;	/* bitmap of masked signals */
+                    //阻塞信号掩码：标记当前“被阻塞”的信号（被阻塞的信号不会触发处理，暂存于 signal 中）
+
+/* various fields */
+	int exit_code;  //进程退出码：存储进程的终止状态，供父进程回收。
+                    //父进程通过 wait()/waitpid() 系统调用读取该值，判断子进程的终止原因。
+	unsigned long start_code,end_code,end_data,brk,start_stack;
+                    //进程内存区域边界：标记进程在内存中的代码段、数据段、栈段等关键地址，用于内存管理
+                    //start_code，代码段起始地址；end_code，代码段长度；
+                    //end_data，数据段长度；brk，堆段当前末尾地址；start_stack，用户栈起始地址。
+	long pid,father,pgrp,session,leader;
+                    //进程ID与亲属关系：``标识进程唯一``性及进程间的父子/组关系，用于进程管理
+	unsigned short uid,euid,suid;
+                    //用户身份标识：控制进程的文件访问权限、系统资源访问权限（Unix 安全模型核心）
+	unsigned short gid,egid,sgid;
+                    //用户组身份标识：控制进程的文件访问权限、系统资源访问权限（Unix 安全模型核心）
+	long alarm;     //闹钟定时器：记录进程设置的闹钟时间，用于实现 alarm() 系统调用
+	long utime,stime,cutime,cstime,start_time;
+                    //进程时间统计：记录进程的 CPU 使用时间，用于资源统计和调度优化
+	unsigned short used_math;
+                    //数学协处理器使用标记：标记进程是否使用 80387 数学协处理器（早期 x86 架构专用）
+
+/* file system info */
+	int tty;		            //进程关联的终端设备号：标记进程对应的终端（如控制台、串口）
+	unsigned short umask;       //文件创建掩码：控制新创建文件的默认权限（屏蔽指定的权限位）
+	struct m_inode * pwd;       //进程当前工作目录的 inode 指针：指向当前工作目录的索引节点（inode）
+	struct m_inode * root;      //进程根目录的 inode 指针：指向进程“根目录”的索引节点（默认是系统根目录 /）
+	struct m_inode * executable;//进程可执行文件的 inode 指针：指向当前进程运行的可执行文件的索引节点
+	unsigned long close_on_exec;//执行 exec() 时需关闭的文件掩码：标记进程中执行 exec() 系统调用后需自动关闭”的文件
+	struct file * filp[NR_OPEN];//文件描述符表：存储进程打开的文件的指针数组，是进程访问文件的核心接口
+
+/* ldt for this task 0 - zero 1 - cs 2 - ds&ss */
+	struct desc_struct ldt[3];  //进程的局部描述符表,
+    //  * 数组结构（3 个描述符，固定用途，不可修改）：
+    //  * - ldt[0]：空描述符（x86 要求 LDT 第一个描述符必须为 0，用于容错）；
+    //  * - ldt[1]：代码段描述符（CS 段寄存器指向该描述符，定义进程代码段的基地址、限长、权限）；
+    //  * - ldt[2]：数据段/栈段描述符（DS、SS 段寄存器指向该描述符，定义数据段/栈段的内存属性）；
+
+/* tss for this task */
+	struct tss_struct tss;      //进程的任务状态段，x86架构进程切换核心
+    //  * 核心逻辑：
+    //  * - 进程切换时，内核将当前进程的寄存器状态保存到其 TSS 中；
+    //  * - 加载新进程时，从其 TSS 中恢复寄存器状态，实现“上下文切换”；
+};
 ```
 
-因为如果不是end_code，这里说不过去。
+#### 1.2.4.2 页面对齐
+这里的`((addr)+4095)&~4095`是啥意思呢？
+
+这里的`((addr)+4095)&~4095`的作用是将地址`addr`对齐到4096字节（即一页）的**边界**。
+具体实现是将`addr`加上4095，然后将结果与0x00000fff的补码按位取反，即使之能够被4096整除。完成页面的对齐。
+这样做的原因是，4096字节是一页的大小，对齐到页边界可以提高内存访问的效率。
+
+#### 1.2.4.3 判断地址空间是否合法
+`((((addr)+4095)&~4095) < current->start_code + current->end_code)`的作用是判断地址`addr`是否在当前进程的代码空间内。如果上述小于成立，则是合法的地址空间。
+
+所以，这里的`current->end_code`是指的进程的**代码空间的长度**，否则这里说不过去了。
 
 ### 1.2.5 copy_page(from,to) 
 
