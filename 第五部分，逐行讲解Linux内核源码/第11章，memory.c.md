@@ -156,9 +156,75 @@ struct task_struct {
 所以，这里的`current->end_code`是指的进程的**代码空间的长度**，否则这里说不过去了。
 
 ### 1.2.5 copy_page(from,to) 
+####  1.2.5.1 代码实现
+代码实现如下：
+```c
+#define copy_page(from,to) \
+    __asm__(
+        "cld ; 
+        rep ; 
+        movsl"//一个双字，即4字节.
+        ::
+        "S" (from),
+        "D" (to),
+        "c" (1024)//1024个4字节，即4KB.
+    )
+```
 
+#### 1.2.5.2 作用
+> 拷贝整个页面，即把一个 `4KB 大小`的`内存页`从 `from 地址`拷贝到 `to 地址`。
+
+#### 1.2.5.3 实现原理
+
+- `cld`：清除方向标志，确保字符串操作指令（如 movsl）从**低地址向高地址**进行复制。
+
+- `rep movsl`：重复执行 **movsl 指令**，直到**计数器（ecx）为 0**。每次 movsl 会**复制 4 字节（一个双字）**，所以当 ecx 初始化为 1024 时，表示要复制 1024 个双字，即 4096 字节（4KB）。
+
+- `"S" (from)`：将 `from` 地址加载到 **esi 寄存器**，作为**源地址**。
+
+- `"D" (to)`：将 `to` 地址加载到 **edi 寄存器**，作为**目的地址**。
+
+- `"c" (1024)`：将 1024 加载到 **ecx 寄存器**，作为**复制的双字数量**。
+
+> 由此看出，这就是C中的嵌入式汇编语句的威力。实质上，**这是gcc的标准，专门用来这么实现的！**
 
 ### 1.2.6 unsigned long get_free_page(void)
+#### 1.2.6.1 代码实现
+```c
+/*
+ * Get physical address of first (actually last :-) free page, and mark it
+ * used. If no free pages left, return 0.
+ */
+// 函数注释：获取第一个（实际是最后一个）空闲页的物理地址，标记为已用，无空闲返回0
+unsigned long get_free_page(void)
+{
+    // 1.绑定寄存器
+register unsigned long __res asm("ax");//这里是一个寄存器eax，用来存储返回值
+    // 2. 内嵌汇编核心逻辑
+
+__asm__("std ; repne ; scasb\n\t"
+	"jne 1f\n\t"
+	"movb $1,1(%%edi)\n\t"
+	"sall $12,%%ecx\n\t"
+	"addl %2,%%ecx\n\t"
+	"movl %%ecx,%%edx\n\t"
+	"movl $1024,%%ecx\n\t"
+	"leal 4092(%%edx),%%edi\n\t"
+	"rep ; stosl\n\t"
+	" movl %%edx,%%eax\n"
+	"1: cld"
+	:"=a" (__res)
+	:"0" (0),"i" (LOW_MEM),"c" (PAGING_PAGES),
+	"D" (mem_map+PAGING_PAGES-1)
+	);
+return __res;
+}
+```
+#### 1.2.6.2 作用
+> 从**内存**中分配一个**空闲页面（物理页）**，并将其**标记为已用**。如果没有空闲页面可用，则返回 0。
+
+#### 1.2.6.3 实现原理
+> 从内存管理的 `mem_map` 数组中**查找并返回**一个**空闲页面的物理地址**。如果没有空闲页面，返回 0。
 
 ### 1.2.7 void free_page(unsigned long addr)
 
