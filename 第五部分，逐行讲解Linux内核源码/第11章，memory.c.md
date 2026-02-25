@@ -85,9 +85,12 @@ static inline void oom(void)
 #define CODE_SPACE(addr) ((((addr)+4095)&~4095) < \
 current->start_code + current->end_code)
 ```
+
 #### 1.2.4.1 进程任务结构体讲解
+
 这里的`current->start_code`和`current->end_code`分别是指啥？
 首先，current是指的当前进程的任务结构体。具体实现如下：
+
 ```c
 struct task_struct {
 /* these are hardcoded - don't touch */
@@ -480,6 +483,62 @@ unsigned long put_page(unsigned long page,unsigned long address)
 }
 ```
 ### 1.2.11 void un_wp_page(unsigned long * table_entry)
+
+#### 1.2.11.1 作用
+
+归根到底是为了改动这个页表项目table_entry
+
+>1.取消页表项的**写保护位**，将页面设置为**可读写**。
+
+>2.处理写时复制情况：如果页面**只被一个进程使用**，只需**设置写标志**，否则**需要复制页面**。
+
+#### 1.2.11.2 代码实现
+
+```c
+void un_wp_page(unsigned long * table_entry/*table_entry,该指针指向一个页表项*/)
+{
+	unsigned long old_page,new_page;//old_page和new_page，分别用于存储旧页面的物理地址和新分配页面的物理地址。
+
+	old_page = 0xfffff000 & *table_entry;//从传入的页表项*table_entry中提取出旧页面的物理地址，并存储在old_page变量中。
+    //物理地址的高20位，用于提取旧页面的物理地址。
+
+    //这里就可以回顾一下之前，我们的物理地址是怎么得来的了：
+
+    //得到线性地址后，线性地址被分成3份，格式如下：
+    /*
+        +---------+------+------+
+        |高10位   |中10位|低12位|
+        +---------+------+------+
+        我们根据这3份地址，就可以找到页表项，页表项的具体格式：
+                页目录项/页表项格式：
+        31                    12 11    9 8 7 6 5 4 3 2 1 0
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        | 页表物理地址高20位    | AVL   |0|0|0|A|0|0|U|W|P|
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        这里，我们就可以得到具体的页面的物理地址的高20位了。再和线性地址的低12位拼接起来，就可以得到具体的页面的物理地址了。
+        所以说，页目录项、页表格式是**距离物理地址最后的格式**了，因为从他们这里找到页表的物理地址后，**再加上偏移地址**(线性地址的低12位)，就得到了**物理地址**。
+    */
+    //检查旧的页面是否可以直接处理。
+    //检查旧页面的物理地址是否在低内存范围之上（old_page >= LOW_MEM），并且该页面在mem_map数组中的引用计数是否为 1(只被一个进程使用)
+	if (old_page >= LOW_MEM && mem_map[MAP_NR(old_page)]==1) {
+        //满足条件，就直接设置写标志位。
+		*table_entry |= 2;
+		invalidate();//使缓存（如处理器的页表缓存 TLB）无效，确保系统能够正确反映页表项的变化。
+		return;
+	}
+    //下面就是被多个进程只用了，还需要复制页面。
+
+    //调用get_free_page函数尝试获取一个空闲页面，并将返回的物理地址存储在new_page变量中。
+	if (!(new_page=get_free_page()))
+		oom();//oom函数在前面也讲了，就是out of Memory。
+	if (old_page >= LOW_MEM)
+		mem_map[MAP_NR(old_page)]--;//减少mem_map数组中对应旧页面的引用计数，表示旧页面的使用者减少一个。
+	*table_entry = new_page | 7;//设置相关内容，111开放。
+	invalidate();
+	copy_page(old_page,new_page);//将旧页面的内容复制到新页面。
+}	
+```
+
 
 ### 1.2.12 void do_wp_page(unsigned long error_code,unsigned long address)
 
