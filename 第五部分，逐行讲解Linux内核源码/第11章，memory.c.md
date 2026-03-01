@@ -564,10 +564,24 @@ void do_no_page(unsigned long error_code,unsigned long address)
 		return;//可以共享，也返回了，处理了问题。
 	if (!(page = get_free_page()))//获取一个空闲页面，并将返回的物理地址存储在page变量中。
 		oom();//处理oom
-/* remember that 1 block is used for header */
+
+    /* remember that 1 block is used for header */
+    /*这里就涉及了文件系统的处理，必须理清才能完全明白
+    
+    
+    */
 	block = 1 + tmp/BLOCK_SIZE;//计算与当前页面相关的文件系统块编号。这里BLOCK_SIZE是文件系统块的大小，tmp是页面相对于进程代码起始地址的偏移量
 	for (i=0 ; i<4 ; block++,i++)//4次循环，也就是函数刚开始的4个数组。
 		nr[i] = bmap(current->executable,block);//调用bmap函数获取当前进程可执行文件中对应块编号block的块设备映射，并将结果存储在nr数组中。
+    /*有没有想过，为啥是4？
+                
+                页表项格式：
+        31                    12 11    9 8 7 6 5 4 3 2 1 0
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        | 页面物理地址高20位     | AVL   |0|0|0|A|0|W|U|P|
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+    */
+
 	bread_page(page,current->executable->i_dev,nr);//调用bread_page函数从块设备中读取页面数据到新分配的页面page中。current->executable->i_dev表示当前进程可执行文件所在的设备，nr数组包含了要读取的块编号信息。
 	i = tmp + 4096 - current->end_data;//计算需要填充为 0 的字节数。tmp是页面相对于进程代码起始地址的偏移量，加上 4096（页面大小）再减去进程数据段结束地址current->end_data，得到页面中超出进程数据段部分的字节数。
 	tmp = page + 4096;//将tmp设置为页面末尾的下一个地址。
@@ -585,7 +599,7 @@ void do_no_page(unsigned long error_code,unsigned long address)
 这里要讲解清楚bread_page函数：
 我们要知道的是，任何和外部设备的读写，都是通过缓冲区来实现的，所以bread_page函数的作用就是**将四个缓冲区的数据读取到所需地址的内存中**。
 同时，它同时读取，能加快速率。
-
+3
 关于缓冲区的内容，linus将其归在fs文件夹下，说明他和文件系统密切相关。我们可以查看：
 [buffer.c的实现](../src/fs/buffer.c)
 
@@ -618,7 +632,35 @@ void bread_page(unsigned long address,int dev,int b[4])
 }
 ```
 ### 1.2.13 void write_verify(unsigned long address)
+#### 1.2.13.1 函数作用
+检查给定线性地址对应的页面**是否可写**。如果页面存在但不可写，函数会采取措施（如**调用un_wp_page函数**）**使其可写**。
 
+#### 1.2.13.2 函数实现
+```c
+void write_verify(unsigned long address/*线性地址*/)
+{
+	unsigned long page;//存储与线性地址相关的页表或页面的物理地址信息。
+
+	if (!( (page = *((unsigned long *) ((address>>20) & 0xffc)) )&1))
+		return;
+    //(address>>20) & 0xffc：右移 20 位是为了提取页目录索引部分，与0xffc与操作确保地址 4 字节对齐。
+
+	page &= 0xfffff000;//从页目录项的值中提取页表的物理地址
+	page += ((address>>10) & 0xffc);//(address>>10) & 0xffc：右移 10 位是为了提取页偏移地址部分，与0xffc与操作确保地址 4 字节对齐。然后将其与前面提取的页表物理地址相加，得到要操作的页表项的实际物理地址。注意，这里仍然得到的是页表项的物理地址，而不是页面的物理地址。要得到实际的物理内存地址，需要从页表项内容中提取页面物理地址高 20 位，再与线性地址的低 12 位（页内偏移）组合。
+    
+	if ((3 & *(unsigned long *) page) == 1) /*即页面里面的低2位为11，也即 non-writeable, present */
+    /*
+               
+                页表项格式：
+        31                    12 11    9 8 7 6 5 4 3 2 1 0
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        | 页面物理地址高20位     | AVL   |0|0|0|A|0|W|U|P|
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+    */
+		un_wp_page((unsigned long *) page);//那么就调用un_wp_page函数将页面设置为可写。
+	return;
+}
+```
 ### 1.2.14 void get_empty_page(unsigned long address)
 
 ### 1.2.15 static int try_to_share(unsigned long address, struct task_struct * p)
