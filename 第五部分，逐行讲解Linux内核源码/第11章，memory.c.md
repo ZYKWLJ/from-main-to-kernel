@@ -647,10 +647,10 @@ void write_verify(unsigned long address/*线性地址*/)
 
 	page &= 0xfffff000;//从页目录项的值中提取页表的物理地址
 	page += ((address>>10) & 0xffc);//(address>>10) & 0xffc：右移 10 位是为了提取页偏移地址部分，与0xffc与操作确保地址 4 字节对齐。然后将其与前面提取的页表物理地址相加，得到要操作的页表项的实际物理地址。注意，这里仍然得到的是页表项的物理地址，而不是页面的物理地址。要得到实际的物理内存地址，需要从页表项内容中提取页面物理地址高 20 位，再与线性地址的低 12 位（页内偏移）组合。
-    
+
 	if ((3 & *(unsigned long *) page) == 1) /*即页面里面的低2位为11，也即 non-writeable, present */
     /*
-               
+    
                 页表项格式：
         31                    12 11    9 8 7 6 5 4 3 2 1 0
         +----------------------+--------+-+-+-+-+-+-+-+-+-+
@@ -662,6 +662,7 @@ void write_verify(unsigned long address/*线性地址*/)
 }
 ```
 ### 1.2.14 void get_empty_page(unsigned long address)
+老子就是喜欢受虐，就是喜欢Linux，搞不懂，我慢慢搞。迟早会明白的。
 
 ### 1.2.15 static int try_to_share(unsigned long address, struct task_struct * p)
 
