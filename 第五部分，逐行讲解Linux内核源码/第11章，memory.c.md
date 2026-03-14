@@ -319,7 +319,7 @@ int free_page_tables(unsigned long from,unsigned long size)
     //线性地址通常被分为三个部分：页目录索引（10 位）、页表索引（10 位）和页内偏移（12 位），总共 32 位。右移 20 位（from >> 20）可以得到页目录索引部分+多出2位用来做对齐。
     /*
     32位线性地址转化为页表地址的结构
-    |*12位*|*10位*|*10位*|
+    |*10位*|*10位*|*12位*|
     即
     |*页目录/页表索引*|*页表项索引*|*页内偏移*|
     */
@@ -663,9 +663,158 @@ void write_verify(unsigned long address/*线性地址*/)
 ```
 ### 1.2.14 void get_empty_page(unsigned long address)
 老子就是喜欢受虐，就是喜欢Linux，搞不懂，我慢慢搞。迟早会明白的。
+#### 1.2.14.1 函数作用
+分配一个**空页面**（未初始化），并**将其映射到指定的线性地址。**
 
+#### 1.2.14.2 函数实现
+```c
+void get_empty_page(unsigned long address/*欲映射到的线性地址*/)
+{
+	unsigned long tmp;//用于存储获取到的空闲页面的物理地址。
+
+	if (!(tmp=get_free_page()) || !put_page(tmp,address)) {
+        //!(tmp=get_free_page())    =>调用get_free_page函数尝试获取一个空闲的物理页面，并将返回的物理地址赋值给tmp。如果get_free_page函数执行失败，tmp将被赋值为 0。
+        //!put_page(tmp,address)    =>调用put_page函数尝试将获取到的空闲页面tmp映射到指定的线性地址address。如果put_page函数执行失败，它将返回 0。
+        //即只要get_free_page获取页面失败，或者put_page映射页面失败，就进入if语句块。所以两者都必须成功，而且，这里先有得地址，再有的放入。
+
+        //这样看来，这个函数也只是一个聚合体，分支都在外面了。
+		free_page(tmp);		/* 0 is ok - ignored */
+		oom();
+	}
+}
+```
 ### 1.2.15 static int try_to_share(unsigned long address, struct task_struct * p)
 
+#### 1.2.15.1 函数作用
+尝试将**指定线性地址上的页面与其他任务共享**。查看该页面是否存在且是否为 “干净”（未被修改）的。如果是，则将其**与当前任务共享**。如果**成功共享**，返回 1；否则返回 0。
+
+>注意看这里的参数是进程结构体指针p，里面有指定的**线性地址**。
+
+#### 1.2.15.2 函数实现
+```c
+static int try_to_share(unsigned long address, struct task_struct * p)
+{
+	unsigned long from;     /*from，用于存储从任务p相关的页表或页目录项中获取的值。*/
+	unsigned long to;       /*to，用于存储与当前任务相关的页表或页目录项中获取的值或新分配的页表地址。*/
+	unsigned long from_page;/*from_page，用于存储任务p中与地址address相关的页表项地址。*/
+	unsigned long to_page;  /*to_page，用于存储当前任务中与地址address相关的页表项地址。*/
+	unsigned long phys_addr;/*phys_addr，用于存储页面的物理地址。*/
+
+	from_page = to_page = ((address>>20) & 0xffc);
+    /*
+        from和to页面都是
+        (address>>20) & 0xffc，这里表达式已经是老生常谈了，主要是线性地址的构成：
+        +---------+------+------+
+        |高10位   |中10位|低12位|
+        +---------+------+------+
+        我们根据这3份地址，就可以找到页表项，页表项的具体格式：
+                页目录项/页表项格式：
+        31                    12 11    9 8 7 6 5 4 3 2 1 0
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        | 页表物理地址高20位    | AVL   |0|0|0|A|0|0|U|W|P|
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        那么这里的>>20，代表着获得高12位，再&0xffc，是为了将地址对齐，确保地址是2^12的倍数，即4字节对齐。
+        这样，既保留了高10位的完整的索引信息，又获得了与4KB对齐的页目录项地址。(这是因为页目录项在内存中的地址是 4 字节对齐的)
+    */
+	from_page += ((p->start_code>>20) & 0xffc);
+    /*
+        from_page += ((p->start_code>>20) & 0xffc);：
+        将任务p的代码起始地址p->start_code右移 20 位并与0xffc进行与操作，
+        得到与任务p代码起始地址相关的页目录项偏移，加到from_page上，
+        就得到任务p中与地址address相关的完整页表项地址。
+    */
+	to_page += ((current->start_code>>20) & 0xffc);
+    /*
+        to_page += ((current->start_code>>20) & 0xffc);：
+        同理，将当前任务的代码起始地址current->start_code进行类似操作，加到to_page上，
+        得到当前任务中与地址address相关的完整页表项地址。
+
+        注意当前任务还在全局变量里面呢！
+    */
+/* is there a page-directory at from? */
+	from = *(unsigned long *) from_page;
+    // 解引用from_page，获取任务p中对应页目录项的值并存储到from中。
+	if (!(from & 1))
+		return 0;
+    // 检查页目录项的最低位（存在位），如果为 0，表示对应的页表不存在，直接返回 0，共享失败。
+	from &= 0xfffff000;
+    // 通过与0xfffff000进行与操作，提取页表的物理地址（假设低 12 位为标志位等其他信息，高 20 位为页表物理地址）。
+    /*
+        31                    12 11    9 8 7 6 5 4 3 2 1 0
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        | 页表物理地址高20位    | AVL   |0|0|0|A|0|0|U|W|P|
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+    */
+	from_page = from + ((address>>10) & 0xffc);
+    // 将地址address右移 10 位并与0xffc进行与操作，得到在页表内的偏移地址（考虑到页表项 4 字节对齐），加到前面提取的页表物理地址上，得到任务p中与地址address相关的页表项地址。
+	phys_addr = *(unsigned long *) from_page;
+    //解引用from_page，获取任务p中与地址address相关的页表项的值，即页面的物理地址及其他标志位信息，存储到phys_addr中。
+    //这里就涉及到了真正的页面物理地址。如下结构
+    /*
+        31                    12 11    9 8 7 6 5 4 3 2 1 0
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        | 页表物理地址高20位    | AVL   |0|0|0|A|0|0|U|W|P|
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+    */
+/* is the page clean and present? */
+	if ((phys_addr & 0x41) != 0x01)
+		return 0;
+    //检查页面的状态。通过与0x41进行与操作，检查页面的存在位（P，最低位）和访问位（A，位 6）。如果页面不存在或已被访问过（非“干净”），则返回 0，共享失败。
+	phys_addr &= 0xfffff000;
+    //提取页面的物理地址（去除低 12 位标志位等信息）。
+     /*
+        31                    12 11    9 8 7 6 5 4 3 2 1 0
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        | 页表物理地址高20位    | AVL   |0|0|0|A|0|0|U|W|P|
+        +----------------------+--------+-+-+-+-+-+-+-+-+-+
+    */
+	if (phys_addr >= HIGH_MEMORY || phys_addr < LOW_MEM)
+		return 0;
+    //检查物理地址的有效性，确保它在允许的内存范围内。不在此范围内，共享失败。
+	to = *(unsigned long *) to_page;
+    //解引用to_page，获取当前任务中对应页目录项的值并存储到to中。
+	if (!(to & 1)) {
+        // 检查当前任务页目录项的最低位（存在位），如果为 0，表示对应的页表不存在。
+		if ((to = get_free_page()))
+            // 尝试获取一个空闲页面，如果获取成功。
+			*(unsigned long *) to_page = to | 7;
+            // 将获取到的空闲页面地址存储到当前任务的页目录项中，并设置一些标志位（|7设置了页表存在、可读可写等低3个标志位）。
+		else
+			oom();//处理内存不足的情况
+	}
+	to &= 0xfffff000;
+        //    提取当前任务页表的物理地址（去除低 12 位标志位等信息）。
+        /*
+            31                    12 11    9 8 7 6 5 4 3 2 1 0
+            +----------------------+--------+-+-+-+-+-+-+-+-+-+
+            | 页表物理地址高20位    | AVL   |0|0|0|A|0|0|U|W|P|
+            +----------------------+--------+-+-+-+-+-+-+-+-+-+
+        */
+	to_page = to + ((address>>10) & 0xffc);
+    // 将地址address右移 10 位并与0xffc进行与操作，得到在页表内的偏移地址（考虑到页表项 4 字节对齐），加到前面提取的当前任务页表物理地址上，得到当前任务中与地址address相关的页表项地址。
+	if (1 & *(unsigned long *) to_page)
+		panic("try_to_share: to_page already exists");
+    // 检查当前任务中与地址address相关的页表项是否已经存在，如果存在，调用panic函数并输出错误信息。
+    //为啥存在了要报错？
+
+/* share them: write-protect */
+
+	*(unsigned long *) from_page &= ~2;
+    // 清除任务p中与地址address相关的页表项的写权限位（假设第 1 位为写权限位，~2即清除第 1 位），设置为写保护。
+	*(unsigned long *) to_page = *(unsigned long *) from_page;
+    // 将任务p中与地址address相关的页表项内容复制到当前任务中对应的页表项，实现页面共享。
+	invalidate();
+    //调用invalidate函数，使缓存（如处理器的页表缓存 TLB）无效，确保系统能够正确反映页表项的变化。
+	phys_addr -= LOW_MEM;
+    // 减去低内存边界值，得到相对于低内存起始地址的偏移量。
+	phys_addr >>= 12;
+    // 右移 12 位，得到该页面在mem_map数组中的索引。
+    //意思，物理地址就是12位的？不是，这个只是页面！页面是4KB的，所以这里右移12位，就是得到改地址对应的页面在mem_map数组中的索引。
+	mem_map[phys_addr]++;
+    // 将mem_map数组中对应页面的引用计数加1，表示该页面现在被一个额外的任务共享使用。
+	return 1;
+}
+```
 ### 1.2.16 static int share_page(unsigned long address)
 
 ### 1.2.17 void do_no_page(unsigned long error_code,unsigned long address)
