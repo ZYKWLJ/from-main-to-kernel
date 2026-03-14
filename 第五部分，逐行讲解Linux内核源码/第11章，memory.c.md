@@ -10,11 +10,25 @@ memory.c位于[memory.c](../src/mm/memory.c)
 一共有19个函数：
 
 |memory.c函数|对应功能|
-|-|-|
-|void oom(void)|xxx|
-|||
-|||
-|||
+|--|--|
+|`void oom(void)`|内存耗尽（Out Of Memory）处理函数，当系统无法分配所需内存时被调用，打印"Out of memory" 并调用`do_exit()`函数退出该进程，完成资源释放，并通知父进程完成资源回收，返回`SIGSEGV`信号|
+|`void invalidate(void)`|刷新页表，将`cr3`寄存器的值设置为0，强制刷新CPU的地址转换缓存（TLB），使CPU丢弃缓存的旧页表映射关系，确保页表修改后地址映射的正确性|
+|`MAP_NR(addr)`|将线性地址转换为物理页面编号|
+|`CODE_SPACE(addr)`|判断线性地址是否在代码空间|
+|`void copy_page(from, to)`|拷贝整个页面，即把一个4KB大小的内存页从`from`地址拷贝到`to`地址|
+|`unsigned long get_free_page(void)`|从内存中分配一个空闲页面（物理页），并将其标记为已用。如果没有空闲页面可用，则返回0|
+|`void free_page(unsigned long addr)`|释放物理页`addr`，并将其标记为空闲。如果`addr`不是有效物理页地址，则`panic`|
+|`int free_page_tables(unsigned long from, unsigned long size)`|释放从指定起始地址`from`开始的连续的`size`个页表及其对应的页面|
+|`int copy_page_tables(unsigned long from, unsigned long to, long size)`|复制从指定起始地址`from`开始的连续的`size`个页表及其对应的页面到以`to`地址为起始地址的连续内存区域|
+|`unsigned long put_page(unsigned long page, unsigned long address)`|将一个物理页`page`放置在内存中指定的线性地址`address`处，并返回该页的物理地址。如果内存不足（无论是访问页表还是页面时），则返回0|
+|`void un_wp_page(unsigned long * table_entry)`|取消页表项的写保护位，将页面设置为可读写。处理写时复制情况：如果页面只被一个进程使用，只需设置写标志，否则需要复制页面|
+|`void do_no_page(unsigned long error_code, unsigned long address)`|处理页面缺失异常，在给定发生页面错误的线性地址和错误码后，通过检查地址范围、尝试共享页面、分配并填充新页面等操作，将合适的页面映射到指定地址，若过程中出现内存不足等问题则进行相应处理|
+|`void write_verify(unsigned long address)`|检查给定线性地址对应的页面是否可写。如果页面存在但不可写，函数会采取措施（如调用`un_wp_page`函数）使其可写|
+|`void get_empty_page(unsigned long address)`|分配一个空页面（未初始化），并将其映射到指定的线性地址|
+|`static int try_to_share(unsigned long address, struct task_struct * p)`|尝试将指定线性地址上的页面与其他任务共享。查看该页面是否存在且是否为 “干净”（未被修改）的。如果是，则将其与当前任务共享。如果成功共享，返回1；否则返回0|
+|`static int share_page(unsigned long address)`|寻找一个能与当前进程共享页面的进程。先对当前进程的可执行文件及其引用计数进行检查，然后遍历系统中的任务列表，筛选出共享相同可执行文件且非自身的进程，并尝试与它们共享页面，最终根据尝试结果返回相应值|
+|`void mem_init(long start_mem, long end_mem)`|初始化内存映射表（mem_map），将物理内存分页标记为已用（USED）或可用（0）|
+|`void calc_mem(void)`|计算系统内存总量，并调用`mem_init`函数进行内存初始化，用于计算和打印内存使用情况相关信息|
 
 ### 1.2.1 static inline void oom(void)
 
@@ -966,7 +980,7 @@ void calc_mem(void)
 		if (!mem_map[i]) free++;/*记录空闲页面个数*/
 	printk("%d pages free (of %d)\n\r",free,PAGING_PAGES);
     // 下面从2~1024完全没必要，因为我们得知，页目录项其实也就是指向的页表地址，一共就4个页表，何必弄到1024去呢！
-    
+
 	for(i=2 ; i<1024 ; i++) {/*遍历页目录项，页目录项通常从索引 2 开始使用（索引 0 和 1 可能有特殊用途）。*/
 		if (1&pg_dir[i]) {/*检查页目录项pg_dir[i]的最低位（存在位），如果为 1，表示该页目录项对应的页表存在。*/
 			pg_tbl=(long *) (0xfffff000 & pg_dir[i]);/*从页目录项pg_dir[i]中提取页表的物理地址（去除低 12 位标志位等信息），并将其存储在pg_tbl指针中。*/
