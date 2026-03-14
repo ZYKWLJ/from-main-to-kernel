@@ -865,11 +865,120 @@ static int share_page(unsigned long address/*address参数表示相对于当前�
 
 
 ### 1.2.17 void do_no_page(unsigned long error_code,unsigned long address)
+#### 1.2.17.1 函数功能
 
+do_no_page函数主要**处理页面缺失异常**，先**检查地址范围**，**尝试共享页面**，若失败则分配页面并从文件系统**读取数据填充页面**，最后**将页面映射到指定地址**，若过程中出现内存不足等问题则进行相应处理。
+
+#### 1.2.17.2 函数代码
+```c
+void do_no_page(unsigned long error_code,unsigned long address/*error_code表示页面错误代码，address表示发生页面缺失的线性地址。*/)
+{
+	int nr[4];/*nr数组用于存储与页面相关的块设备映射信息。每个元素可能对应一个块设备的块编号，用于后续从设备读取数据到内存中。*/
+	unsigned long tmp;/*声明一个无符号长整型变量tmp，用于临时存储计算过程中的地址偏移量或其他相关值。*/
+	unsigned long page;/*声明一个无符号长整型变量page，用于存储从内存中获取的空闲页面的物理地址。*/
+	int block,i;/*声明两个整数变量block和i，block可能用于表示文件系统中的块编号，i用于循环计数。*/
+
+	address &= 0xfffff000;/*对齐4KB*/
+	tmp = address - current->start_code;/*计算发生页面缺失的地址address相对于当前进程代码起始地址current->start_code的偏移量，并将结果存储在tmp中。*/
+	if (!current->executable || tmp >= current->end_data) {/*检查当前进程是否有可执行文件*/
+		get_empty_page(address);/*如果当前进程没有可执行文件，或者偏移量tmp超出了当前进程数据段的结束地址current->end_data，那么调用get_empty_page函数获取一个空页面，并将其映射到address处。*/
+		return;
+	}
+    /*尝试共享页面*/
+	if (share_page(tmp))
+		return;
+    /*调用get_free_page函数获取一个空闲的物理页面，并将返回的物理地址存储在page变量中。如果获取失败,调用oom*/
+	if (!(page = get_free_page()))
+		oom();
+    /* remember that 1 block is used for header */
+	block = 1 + tmp/BLOCK_SIZE;    
+    /*计算与当前页面相关的文件系统块编号。这里BLOCK_SIZE是文件系统块的大小，tmp是页面相对于进程代码起始地址的偏移量，加 1 是因为文件系统中有一个块用于存储头部信息。*/
+	for (i=0 ; i<4 ; block++,i++)
+		nr[i] = bmap(current->executable,block);
+    //调用bmap函数获取当前进程可执行文件中对应块编号block的块设备映射，并将结果存储在nr数组中。bmap函数可能用于在文件系统中查找块的物理位置。
+    //为什么这里是4？
+    /*
+        1、每个页面通常包含多个文件系统块。
+        2、文件系统块是文件系统中最小的存储单位，通常用于存储文件数据或元数据。
+        3、每个页面可能对应多个文件系统块，这些块可能分布在不同的物理位置上。
+        4、bmap函数的作用是根据文件系统块编号查找对应的物理块位置。
+    */
+	bread_page(page,current->executable->i_dev,nr);
+    /*
+        调用bread_page函数从块设备中读取页面数据到新分配的页面page中。
+        current->executable->i_dev表示当前进程可执行文件所在的设备，nr数组包含了要读取的块编号信息。
+    */
+	i = tmp + 4096 - current->end_data;
+    // 计算需要填充为 0 的字节数。
+    // tmp是页面相对于进程代码起始地址的偏移量，加上 4096（页面大小）再减去进程数据段结束地址current->end_data，得到页面中超出进程数据段部分的字节数。
+
+    // 从页面的末尾开始填充 0，直到填充到进程数据段结束地址current->end_data。
+	tmp = page + 4096;
+	while (i-- > 0) {
+		tmp--;
+		*(char *)tmp = 0;
+	}
+    // 调用put_page函数将获取到的页面page映射到发生页面缺失的地址address处。如果映射成功（put_page返回非 0 值）
+	if (put_page(page,address))
+		return;
+    // 如果页面映射失败，调用free_page函数释放之前分配的页面。
+	free_page(page);
+	oom();
+}
+```
 ### 1.2.18 void mem_init(long start_mem, long end_mem)
+#### 1.2.18.1 函数功能
+**初始化内存映射表**（mem_map），将物理内存分页标记为**已用（USED）**或可用（0）。
+
+#### 1.2.18.2 函数代码
+```c
+void mem_init(long start_mem, long end_mem/*初始化内存的函数，start_mem表示内存起始地址，end_mem表示内存结束地址。*/)
+{
+	int i;
+
+	HIGH_MEMORY = end_mem;
+	for (i=0 ; i<PAGING_PAGES ; i++)/*PAGING_PAGES是一个预定义的常量，表示系统中总的页面数量。*/
+		mem_map[i] = USED;/*将mem_map数组中的每个元素都设置为USED，表示所有页面初始状态为已用。*/
+
+	i = MAP_NR(start_mem);/*将内存起始地址start_mem转换为对应的页面索引，并赋值给变量i。*/
+	end_mem -= start_mem;/*计算从start_mem到end_mem的内存大小，即总的内存字节数。*/
+	end_mem >>= 12;/*由于页面大小通常为 4KB（2 的 12 次方字节），将总的内存字节数右移 12 位，得到从start_mem到end_mem之间的页面数量。*/
+	while (end_mem-->0)/*循环遍历从start_mem到end_mem之间的每个页面，将对应的mem_map数组元素设置为0，表示这些页面是可用的。*/
+		mem_map[i++]=0;
+}
+```
 
 ### 1.2.19 void calc_mem(void)
 
+#### 1.2.19.1 函数功能
+
+计算系统内存总量，并调用mem_init函数进行内存初始化。
+用于**计算**和**打印内存使用情况**相关信息。
+
+#### 1.2.19.2 函数代码
+```c
+void calc_mem(void)
+{
+	int i,j,k,free=0;
+	long * pg_tbl;/*指针pg_tbl，用于指向页表。*/
+
+	for(i=0 ; i<PAGING_PAGES ; i++)
+		if (!mem_map[i]) free++;/*记录空闲页面个数*/
+	printk("%d pages free (of %d)\n\r",free,PAGING_PAGES);
+    // 下面从2~1024完全没必要，因为我们得知，页目录项其实也就是指向的页表地址，一共就4个页表，何必弄到1024去呢！
+    
+	for(i=2 ; i<1024 ; i++) {/*遍历页目录项，页目录项通常从索引 2 开始使用（索引 0 和 1 可能有特殊用途）。*/
+		if (1&pg_dir[i]) {/*检查页目录项pg_dir[i]的最低位（存在位），如果为 1，表示该页目录项对应的页表存在。*/
+			pg_tbl=(long *) (0xfffff000 & pg_dir[i]);/*从页目录项pg_dir[i]中提取页表的物理地址（去除低 12 位标志位等信息），并将其存储在pg_tbl指针中。*/
+			for(j=k=0 ; j<1024 ; j++)   /*用于遍历当前页表中的 1024 个页表项。*/
+				if (pg_tbl[j]&1)        /*检查页表项pg_tbl[j]的最低位（存在位），如果为 1，表示该页表项对应的页面存在（已使用）。*/
+					k++;                /*统计当前页表中已使用的页面数量，并将结果存储在变量k中。*/
+			printk("Pg-dir[%d] uses %d pages\n",i,k);
+		}
+	}
+}
+
+```
 
 
 # 2.memory.c的源码分析
